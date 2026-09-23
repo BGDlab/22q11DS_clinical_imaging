@@ -1,0 +1,445 @@
+---
+title: "Extreme Deviation Rates (Figure 2)"
+author: "Benjamin Jung, PhD"
+format:
+  pdf:
+    documentclass: scrreprt
+    toc: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r setup}
+#| echo: false
+#| output: false
+#| label: load-utils-and-data
+source("util_scripts/utils.R")
+load('../data/analysis_prep_combined.RData')
+```
+
+```{r}
+#| label: load-and-split-cohorts
+#| output: false
+df_chop <- df %>% filter(Source == "CHOP")
+df_enigma <- df %>% filter(Source == "ENIGMA")
+```
+
+## Calculate Outliers
+
+### Region-Specific Outlier Proportions
+
+```{r}
+#| label: outlier-rate-permutation-null
+#| output: false
+thresh = 0.025
+n_perm <- 1000
+
+outlier_df <- df %>% select(dx, Source, contains("Transformed.q.wre")) %>%
+          pivot_longer(contains("Transformed.q.wre"), names_to = "feature",
+                       values_to = "centile") %>%
+          filter(feature %in% glue("{features}Transformed.q.wre")) %>%
+          mutate(type = case_when(centile <= thresh ~ "low",
+                                  centile >= (1 - thresh) ~ "high",
+                                  .default = "normal")) %>%
+          na.omit() %>%
+          group_by(Source, feature, dx) %>%
+          summarize(prop_low = sum(type == "low")/n(),
+                    prop_high = sum(type == "high")/n(),
+                    median = median(centile, na.rm = T),
+                    var = var(centile, na.rm = T),
+                    .groups = "drop_last") %>%
+          pivot_wider(names_from = dx, values_from = prop_low:var) %>% 
+          arrange(Source, feature) %>%
+          mutate(diff_low = prop_low_22q11DS - prop_low_CN,
+                 diff_high = prop_high_22q11DS - prop_high_CN)
+
+# Null distribution for the extreme-deviation rate: shuffle dx labels within each
+# cohort and recompute the case-control difference in extreme (low/high) proportions,
+# to test whether the observed rate in 22q11DS exceeds what's expected by chance.
+for (i in 1:n_perm) {
+  for (source in c("CHOP","ENIGMA")) {
+    df_perm <- df %>% filter(Source == source) %>% mutate(dx = sample(dx))
+  
+  outlier_perm_df <- df_perm %>% select(dx, Source, contains("Transformed.q.wre")) %>%
+          pivot_longer(contains("Transformed.q.wre"), names_to = "feature",
+                       values_to = "centile") %>%
+          filter(feature %in% glue("{features}Transformed.q.wre")) %>%
+          mutate(type = case_when(centile <= thresh ~ "low",
+                                  centile >= (1 - thresh) ~ "high",
+                                  .default = "normal")) %>%
+          na.omit() %>%
+          group_by(Source, feature, dx) %>%
+          summarize(prop_low = sum(type == "low")/n(),
+                    prop_high = sum(type == "high")/n(),
+                    median = median(centile, na.rm = T),
+                    var = var(centile, na.rm = T),
+                    .groups = "drop_last") %>%
+          pivot_wider(names_from = dx, values_from = prop_low:var) %>% 
+          arrange(Source, feature) %>%
+          mutate(diff_low = prop_low_22q11DS - prop_low_CN,
+                 diff_high = prop_high_22q11DS - prop_high_CN,
+                 perm = i)
+  
+    if(i == 1 & source == "CHOP") {
+      outlier_perms <- outlier_perm_df
+    } else {
+      outlier_perms <- bind_rows(outlier_perms, outlier_perm_df)
+    }
+  }
+}
+```
+
+```{r}
+#| label: permutation-pvalues-and-fdr
+#| output: false
+# Permutation p-value: proportion of shuffled-label permutations whose case-control
+# difference in extreme-deviation rate exceeds the observed difference.
+outlier_df$p_low <- NA
+outlier_df$p_high <- NA
+for (i in 1:nrow(outlier_df)) {
+  perms_tmp <- outlier_perms %>% filter(Source == outlier_df$Source[i] &
+                                        feature == outlier_df$feature[i])
+  outlier_df$p_low[i] <- sum(perms_tmp$diff_low > outlier_df$diff_low[i])/n_perm
+  outlier_df$p_high[i] <- sum(perms_tmp$diff_high > outlier_df$diff_high[i])/n_perm
+}
+outlier_df <- outlier_df %>%
+                  pivot_wider(id_cols = feature, names_from = Source, 
+                              values_from = prop_low_CN:p_high) %>%
+                  mutate(p.fdr_low_ENIGMA  = p.adjust(p_low_ENIGMA, method = "fdr"),
+                         p.fdr_high_ENIGMA = p.adjust(p_high_ENIGMA, method = "fdr"),
+                         p.sig_low_ENIGMA  = ifelse(p.fdr_low_ENIGMA <= 0.05, "p.fdr < 0.05",
+                                                    "n.s."),
+                         p.sig_high_ENIGMA  = ifelse(p.fdr_high_ENIGMA <= 0.05, "p.fdr < 0.05",
+                                                    "n.s."),
+                         p.fdr_low_CHOP    = p.adjust(p_low_CHOP, method = "fdr"),
+                         p.fdr_high_CHOP   = p.adjust(p_high_CHOP, method = "fdr"),
+                         p.sig_low_CHOP  = ifelse(p.fdr_low_CHOP <= 0.05, "p.fdr < 0.05",
+                                                    "n.s."),
+                         p.sig_high_CHOP  = ifelse(p.fdr_high_CHOP <= 0.05, "p.fdr < 0.05",
+                                                    "n.s."),
+                         feature = str_remove_all(feature,"Transformed.q.wre"),
+                         label = feature)
+```
+
+### Permutation Test
+
+```{r}
+#| label: chop-enigma-correlation-permutation-test
+cats <- c("GM","SA","CT")
+
+res <- expand_grid(measure = cats,
+                   level = c("low","high"))
+res$corr <- NA
+res$pval <- NA
+
+for (cat in cats) {
+  
+  # Calculate actual correlation
+  res$corr[res$measure == cat & res$level == "low"] <- cor(outlier_df %>% filter(grepl(glue("{cat}\\."),feature)) %>% 
+                                                             pull(prop_low_22q11DS_CHOP),
+                                                            outlier_df %>% filter(grepl(glue("{cat}\\."),feature)) %>% 
+                                                              pull(prop_low_22q11DS_ENIGMA),
+                                                            method = "pearson")
+  
+  
+  res$corr[res$measure == cat & res$level == "high"] <- cor(outlier_df %>% filter(grepl(glue("{cat}\\."),feature)) %>% 
+                                                             pull(prop_high_22q11DS_CHOP),
+                                                            outlier_df %>% filter(grepl(glue("{cat}\\."),feature)) %>% 
+                                                              pull(prop_high_22q11DS_ENIGMA),
+                                                            method = "pearson")
+  
+  # Calculate null correlations (high overlap)
+  outlier_tmp <- outlier_perms %>% ungroup() %>% 
+                    mutate(feature = str_remove_all(feature,"Transformed.q.wre")) %>%
+                    filter(Source == "CHOP", grepl(glue("{cat}\\."),feature)) %>% 
+                    select(feature, prop_high_22q11DS, perm) %>%
+                    pivot_wider(names_from = perm, values_from = prop_high_22q11DS,
+                                names_prefix = "prop_high_") %>%
+                    left_join(outlier_df %>% select(feature, prop_high_22q11DS_ENIGMA)) %>%
+                    select(-feature)
+
+  corrs_tmp <- cor(outlier_tmp %>% select(-contains("ENIGMA")),
+                   outlier_tmp %>% select(contains("ENIGMA")),
+                                            method = "pearson")
+  
+  res$pval[res$measure == cat & res$level == "high"] <- sum(corrs_tmp >= res$corr[res$measure == cat & res$level == "high"])/n_perm
+  
+  # Calculate null correlations (low overlap)
+  outlier_tmp <- outlier_perms %>% ungroup() %>% 
+                    mutate(feature = str_remove_all(feature,"Transformed.q.wre")) %>%
+                    filter(Source == "CHOP", grepl(glue("{cat}\\."),feature)) %>% 
+                    select(feature, prop_low_22q11DS, perm) %>%
+                    pivot_wider(names_from = perm, values_from = prop_low_22q11DS, names_prefix = "prop_high_") %>%
+                    left_join(outlier_df %>% select(feature, prop_low_22q11DS_ENIGMA)) %>%
+                    select(-feature)
+
+  corrs_tmp <- cor(outlier_tmp %>% select(-contains("ENIGMA")),
+                   outlier_tmp %>% select(contains("ENIGMA")),
+                                            method = "pearson")
+  
+  res$pval[res$measure == cat & res$level == "low"] <- sum(corrs_tmp >= res$corr[res$measure == cat & res$level == "low"])/n_perm
+
+  
+}
+print(res)
+```
+
+### Spin Test
+
+```{python}
+#| echo: false
+#| output: false
+#| label: cortical-spin-test
+import python_util
+import pandas as pd
+n_perm = 1000
+
+prop_df = r.outlier_df
+cats = ["GM","SA","CT"]
+res = pd.DataFrame(columns=['corr', 'pval'], index=cats)
+parcellation, dk_info = python_util.define_parcellation()
+
+for cat in cats:
+  low_chop_tmp = prop_df.loc[prop_df.label.str.startswith(cat),
+                      ["feature","label","prop_low_22q11DS_CHOP"]].copy()
+  low_chop_tmp["prop_low"] = low_chop_tmp["prop_low_22q11DS_CHOP"]                    
+  low_enigma_tmp = prop_df.loc[prop_df.label.str.startswith(cat),
+                      ["feature","label","prop_low_22q11DS_ENIGMA"]].copy()
+  low_enigma_tmp["prop_low"] = low_enigma_tmp["prop_low_22q11DS_ENIGMA"] 
+  
+  low_chop_tmp.loc[:,"hemi_label"]   = low_chop_tmp["label"].str.replace(f"{cat}.","")
+  low_enigma_tmp.loc[:,"hemi_label"] = low_enigma_tmp["label"].str.replace(f"{cat}.","")
+
+  # Spin test                  
+  res.loc[cat,["corr","pval"]] = python_util.spin_test(low_chop_tmp,
+                                                       low_enigma_tmp, 
+                                                      "prop_low", dk_info, parcellation)
+  
+```
+
+```{python}
+#| results: hold
+#| label: print-spin-test-results
+print("Cortical Spin Test of CHOP and ENIGMA Effect Sizes:")
+print(res)
+```
+
+### Generate Plots
+
+```{r}
+#| label: set-plot-limits
+#| output: false
+plot_lims_low_main <- c(0,ceiling(max(outlier_df$prop_low_22q11DS_CHOP)*20)/20)
+plot_lims_high_main <- c(0,ceiling(max(outlier_df$prop_high_22q11DS_CHOP)*20)/20)
+
+plot_lims_low <- c(0,ceiling(max(outlier_df$prop_low_22q11DS_CHOP,outlier_df$prop_low_22q11DS_ENIGMA)*20)/20)
+plot_lims_high <- c(0,ceiling(max(outlier_df$prop_high_22q11DS_CHOP,outlier_df$prop_high_22q11DS_ENIGMA)*20)/20)
+```
+
+#### Generate Formatted Report Table
+
+```{r}
+#| label: build-formatted-outlier-tables
+outlier_fmt <- outlier_df %>% 
+                  ungroup() %>%
+                  relocate(label, .before = feature) %>%
+                  select(-feature, -starts_with("var_"), -starts_with("median_"), 
+                         -starts_with("diff_"), -starts_with("p.sig_")) %>%
+                  mutate(label = case_match(label,
+                                            "Cerebellum.all" ~ "Cerebellum",
+                                            "SUBC.Left_Accumbens.area" ~ "SUBC.Left_Accumbens",
+                                            "SUBC.Right_Accumbens.area" ~ "SUBC.Right_Accumbens",
+                                            .default = label)) %>%
+                  separate_wider_delim(label, delim = ".", names = c("IDP Group", "IDP"),
+                                       too_few = "align_end") %>%
+                  mutate(`IDP Group` = ifelse(is.na(`IDP Group`), "Global", `IDP Group`),
+                         `IDP Group` = factor(`IDP Group`, levels = c("Global","SUBC","GM","SA","CT")),
+                         across(contains("prop"), ~ round(.x, 2)),
+                         across(starts_with("p_"), ~ round(.x, 3)),
+                         across(starts_with("p\\."), ~ round(.x, 3))) %>%
+                  select(`IDP Group`, IDP,
+                         prop_low_22q11DS_CHOP, prop_low_CN_CHOP, 
+                         p_low_CHOP, p.fdr_low_CHOP,
+                         prop_high_22q11DS_CHOP, prop_high_CN_CHOP, 
+                         p_high_CHOP, p.fdr_high_CHOP,
+                         prop_low_22q11DS_ENIGMA, prop_low_CN_ENIGMA, 
+                         p_low_ENIGMA, p.fdr_low_ENIGMA,
+                         prop_high_22q11DS_ENIGMA, prop_high_CN_ENIGMA, 
+                         p_high_ENIGMA, p.fdr_high_ENIGMA) %>%
+                  arrange(`IDP Group`, IDP)
+
+outlier_fmt_chop <- outlier_fmt %>% select(`IDP Group`, IDP, contains("CHOP"))
+outlier_fmt_enigma <- outlier_fmt %>% select(`IDP Group`, IDP, contains("ENIGMA"))
+
+colnames(outlier_fmt_chop) <- colnames(outlier_fmt_chop) %>%
+                            str_replace_all("22q11DS","22q11DS") %>%
+                            str_replace_all("CN","CN") %>%
+                            str_replace_all("prop_low_","") %>%
+                            str_replace_all("prop_high_","") %>%
+                            str_remove_all("_CHOP") %>%
+                            str_remove_all("_low") %>%
+                            str_remove_all("_high") %>%
+                            str_replace_all("p.fdr","p (FDR)")
+
+
+colnames(outlier_fmt_enigma) <- colnames(outlier_fmt_enigma) %>%
+                            str_replace_all("22q11DS","22q11DS") %>%
+                            str_replace_all("CN","CN") %>%
+                            str_replace_all("prop_low_","") %>%
+                            str_replace_all("prop_high_","") %>%
+                            str_remove_all("_ENIGMA") %>%
+                            str_remove_all("_low") %>%
+                            str_remove_all("_high") %>%
+                            str_replace_all("p.fdr","p (FDR)")
+
+outlier_fmt_chop
+write_csv(outlier_fmt_chop, "../tables/formatted/table_s07.csv")
+
+outlier_fmt_enigma
+write_csv(outlier_fmt_enigma, "../tables/formatted/table_s08.csv")
+```
+
+### CHOP Extreme-Deviation Maps (Figure 2)
+
+```{r, fig.width = 6.5, fig.height = 6.5}
+#| output: false
+#| label: chop-outlier-brain-maps
+
+
+p_chop_outliers_high_main <- plot_extreme_deviation_maps(outlier_df, 
+                           fill_col = "prop_high_22q11DS_CHOP",
+                           color_scheme = c("white","goldenrod","firebrick"),
+                           plot_lims = plot_lims_high_main, fill_name = "",
+                           colorbar_title = ">97.5th %tile ",
+                           sig_col = "p.sig_high_CHOP", p_col = "p_high_CHOP",
+                           cats = c("GM", "SA","CT", "SUBC"),
+                           cort_only = F, add_colorbar = T, exclude_y_label = F,
+                           formatted = T)
+
+p_chop_outliers_low_main <- plot_extreme_deviation_maps(outlier_df, 
+                           fill_col = "prop_low_22q11DS_CHOP", 
+                           color_scheme = c("white","cyan","royalblue"),
+                           plot_lims = plot_lims_low_main, fill_name = "",
+                           colorbar_title = "<2.5th %tile ",
+                           sig_col = "p.sig_low_CHOP", p_col = "p_low_CHOP",
+                           cats = c("GM", "SA","CT", "SUBC"),
+                           cort_only = F, add_colorbar = T, exclude_y_label = F,
+                           formatted = T)
+
+corrs <- res %>% pivot_wider(names_from = "level", values_from = c("corr","pval"))
+```
+
+```{r, fig.width = 6.69, fig.height = 3.5}
+#| label: save-chop-extreme-deviation-figure
+#| fig-cap: "Figure 2. Proportion of 22q11DS cases with extreme deviations in the CHOP cohort: (A) below the 2.5th percentile and (B) above the 97.5th percentile."
+
+ggarrange(NULL, p_chop_outliers_low_main, 
+          NULL, p_chop_outliers_high_main, 
+          nrow = 2, ncol = 2, widths = c(0.15,2.1),
+          labels = c("A)","","B)","")) + figure_theme
+
+ggsave("../figures_final/png/figure_2_extreme_deviations_chop.png", bg = "white")
+ggsave("../figures_final/pdf/figure_2_extreme_deviations_chop.pdf", bg = "white")
+```
+
+### ENIGMA-22q Extreme-Deviation Maps (Figure S7)
+
+```{r, fig.width = 6.5, fig.height = 6.5}
+#| output: false
+#| label: enigma-outlier-brain-maps
+
+p_enig_outliers_high_main <- plot_extreme_deviation_maps(outlier_df, 
+                           fill_col = "prop_high_22q11DS_ENIGMA",
+                           color_scheme = c("white","goldenrod","firebrick"),
+                           plot_lims = plot_lims_high_main, fill_name = "",
+                           colorbar_title = ">97.5th %tile ",
+                           sig_col = "p.sig_high_ENIGMA", p_col = "p_high_ENIGMA",
+                           cats = c("GM", "SA","CT", "SUBC"),
+                           cort_only = F, add_colorbar = T, exclude_y_label = F,
+                           formatted = T)
+
+p_enig_outliers_low_main <- plot_extreme_deviation_maps(outlier_df, 
+                           fill_col = "prop_low_22q11DS_ENIGMA", 
+                           color_scheme = c("white","cyan","royalblue"),
+                           plot_lims = plot_lims_low_main, fill_name = "",
+                           colorbar_title = "<2.5th %tile ",
+                           sig_col = "p.sig_low_ENIGMA", p_col = "p_low_ENIGMA",
+                           cats = c("GM", "SA","CT", "SUBC"),
+                           cort_only = F, add_colorbar = T, exclude_y_label = F,
+                           formatted = T)
+```
+
+```{r, fig.width = 6.69, fig.height = 3.5}
+#| label: save-enigma-extreme-deviation-figure
+#| fig-cap: "Figure S7. Proportion of 22q11DS cases with extreme deviations in the ENIGMA cohort: (A) below the 2.5th percentile and (B) above the 97.5th percentile."
+
+ggarrange(NULL, p_enig_outliers_low_main, 
+          NULL, p_enig_outliers_high_main, 
+          nrow = 2, ncol = 2, widths = c(0.15,2.1),
+          labels = c("A)","","B)","")) + figure_theme
+
+ggsave("../figures_final/png/figure_s7_extreme_deviations_enigma.png", bg = "white")
+ggsave("../figures_final/pdf/figure_s7_extreme_deviations_enigma.pdf", bg = "white")
+```
+
+```{r, fig.width = 6.67, fig.height = 6}
+#| label: chop-enigma-correlation-scatterplots
+#| fig-cap: "Figure S8. Correlation between CHOP and ENIGMA regional extreme deviation rates in 22q11DS cases, for extreme low (top) and extreme high (bottom) deviations, by imaging metric."
+
+plot_df <- outlier_df %>% 
+            filter(grepl("GM\\.|SA\\.|CT\\.",label)) %>%
+            separate_wider_delim(label,delim = ".", names = c("measure","label")) %>%
+      left_join(corrs) %>%
+      mutate(measure = factor(measure, levels = c("GM","SA","CT"),
+                              labels = c("Grey Matter Volume", "Surface Area", "Cortical Thickness")),
+             corr_low = as.character(round(corr_low,2)),
+             pval_low = as.character(round(pval_low,4)),
+             corr_high = as.character(round(corr_high,2)),
+             pval_high = as.character(round(pval_high,4)),
+             label_text_low = paste0(
+                              "r == ", corr_low,
+                              "~','~p[perm] == ", pval_low),
+             label_text_low = str_replace_all(label_text_low, "== 0$", "< 0.001"),
+             label_text_low = ifelse(label == "lh_bankssts",label_text_low, ""),
+             label_text_high = paste0(
+                              "r == ", corr_high,
+                              "~','~p[perm] == ", pval_high),
+             label_text_high = str_replace_all(label_text_high, "== 0$", "< 0.001"),
+             label_text_high = ifelse(label == "lh_bankssts",label_text_high, ""))
+
+p1 <- ggplot(plot_df, aes(x = prop_low_22q11DS_CHOP, y = prop_low_22q11DS_ENIGMA)) + 
+  geom_point() + 
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") + 
+  facet_wrap(~ measure, nrow = 1) + coord_fixed(ratio = 1) +
+  theme_pubclean() + 
+  xlab("Prop Extreme Low (CHOP)") +
+  ylab("Prop Extreme Low (ENIGMA)") +
+  xlim(0,0.5) + ylim(0,0.5) +
+  geom_text(aes(label = label_text_low, x=0.25, y=0.45), parse = T, size = 4)
+
+p2 <- ggplot(plot_df, aes(x = prop_high_22q11DS_CHOP, y = prop_high_22q11DS_ENIGMA)) + 
+  geom_point() + 
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") + 
+  facet_wrap(~ measure, nrow = 1) + coord_fixed(ratio = 1) +
+  theme_pubclean() + 
+  xlab("Prop Extreme High (CHOP)") +
+  ylab("Prop Extreme High (ENIGMA)") +
+  xlim(0,0.5) + ylim(0,0.5) +
+  geom_text(aes(label = label_text_high, x=0.25, y=0.45), parse = T, size = 4)
+  
+
+ggarrange(p1, p2, nrow = 2)
+ggsave("../figures_final/png/figure_s8_extreme_deviation_correlation.png", bg = "white")
+ggsave("../figures_final/pdf/figure_s8_extreme_deviation_correlation.pdf", bg = "white")
+```
+
+## Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

@@ -1,0 +1,148 @@
+---
+title: "Age-by-Diagnosis Interaction Effects (Figure S4)"
+author: "Benjamin Jung, PhD"
+format:
+  pdf:
+    documentclass: scrreprt
+    toc: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r setup}
+#| echo: false
+#| output: false
+#| label: load-utils-and-data
+source("util_scripts/utils.R")
+load('../data/analysis_prep_combined.RData')
+```
+
+```{r}
+#| label: split-cohorts
+#| output: false
+df_chop <- df %>% filter(Source == "CHOP")
+df_enigma <- df %>% filter(Source == "ENIGMA")
+```
+
+## Age Effects
+
+### CHOP
+
+```{r}
+#| output: false
+#| label: chop-age-interaction-model
+cov_str <- " + sex + euler"
+rand_str <- ""
+
+mpr_only_cols <- features[grepl("CT",features)]
+
+# dx * age_days interaction term: tests whether the case-control effect on
+# deviation scores changes with age.
+res <- fit_interaction_model_continuous(df_chop, cov_str, features, rand_str = rand_str,
+                                  model_type = "zscore", mpr_only_cols = mpr_only_cols)
+
+res_chop <- summarize_model_results(res,"predictor22q11DS:interactor")
+```
+
+```{r}
+#| echo: false
+#| label: chop-results-summary
+print_top_significant_results(res_chop)
+summarize_results_by_cortex(res_chop, caption = "Age Interaction Results Grouped by Cortex in CHOP")
+```
+
+### ENIGMA
+
+```{r}
+#| label: enigma-age-interaction-model
+#| output: false
+cov_str <- " + sex + euler"
+rand_str <- ""
+
+mpr_only_cols <- c()
+
+res <- fit_interaction_model_continuous(df_enigma, cov_str, features, rand_str = rand_str, 
+                                  model_type = "zscore", mpr_only_cols = mpr_only_cols)
+
+res_enigma <- summarize_model_results(res,"predictor22q11DS:interactor")
+```
+
+```{r}
+#| echo: false
+#| label: enigma-results-summary
+print_top_significant_results(res_enigma)
+summarize_results_by_cortex(res_enigma, caption = "Age Interaction Results Grouped by Cortex in ENIGMA")
+```
+
+### Generate Plots
+
+```{r}
+#| label: set-plot-limits
+#| output: false
+fill_col <- "Cohens_d"
+ci_lo_col <- "Cohens_d_ci_lo"
+ci_hi_col <- "Cohens_d_ci_hi"
+sig_col  <- "sig"
+colorbar_title <- "Cohen's d"
+max_lim <- max(ceiling(abs(res_chop$Cohens_d)*10)/10, 
+               ceiling(abs(res_enigma$Cohens_d)*10)/10)
+plot_lims <- c(-1*max_lim,max_lim)
+```
+
+```{r}
+#| label: build-effect-plots
+#| output: false
+p_chop <- assemble_main_figure_layout(res_chop, df_chop, fill_col, color_scheme, plot_lims,
+                 plot_type = "zscore", colorbar_title = colorbar_title,sig_col = sig_col,
+                 formatted = T, bar_global = T) + figure_theme
+
+p_enigma <- assemble_main_figure_layout(res_enigma, df_enigma, fill_col, color_scheme, plot_lims,
+                 plot_type = "zscore", colorbar_title = colorbar_title,sig_col = sig_col,
+                 formatted = T, bar_global = T) + figure_theme
+```
+
+```{r, fig.width = 8.5, fig.height = 6.5}
+#| echo: false
+#| label: chop-effect
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the CHOP cohort."
+p_chop
+```
+
+```{r, fig.width = 8.5, fig.height = 6.5}
+#| echo: false
+#| label: enigma-effect
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the ENIGMA Cohort."
+p_enigma
+```
+
+#### Combine Plots
+
+```{r, fig.width = 6.69, fig.height = 10}
+#| label: combine-and-save-figure
+#| fig-cap: "Figure S4. Age-by-diagnosis interaction effects on global and regional centile scores of structural MRI metrics in the CHOP and ENIGMA cohorts."
+t1 <- ggdraw() + 
+  draw_label("CHOP", x = 0.01, hjust = 0, fontface = "bold")
+t2 <- ggdraw() + 
+  draw_label("ENGIMA", x = 0.01, hjust = 0, fontface = "bold")
+
+caption <- ggdraw() +
+              draw_label(glue(' '))
+
+p <- ggarrange(t1, p_chop, t2, p_enigma, nrow = 4, heights = c(0.08,1, 0.08, 1)) + figure_theme
+ggarrange(p, caption, heights = c(11.6,0.5), ncol = 1) + figure_theme
+
+dir.create("../figures_final/", showWarnings = FALSE)
+ggsave("../figures_final/png/figure_s4_age_by_diagnosis.png", bg = 'white')
+ggsave("../figures_final/pdf/figure_s4_age_by_diagnosis.pdf", bg = 'white')
+```
+
+## Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

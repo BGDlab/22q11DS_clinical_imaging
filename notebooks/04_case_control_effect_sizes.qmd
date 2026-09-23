@@ -1,0 +1,1460 @@
+---
+title: "Case-Control Effect Sizes and Sensitivity Analyses (Figure 1)"
+author: "Benjamin Jung, PhD"
+format:
+  pdf:
+    documentclass: scrreprt
+    toc: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r setup}
+#| echo: false
+#| output: false
+#| label: setup
+source("util_scripts/utils.R")
+library(foreach)
+library(doParallel)
+library(doRNG)
+```
+
+```{r}
+#| label: load-analysis-data
+#| output: false
+load('../data/analysis_prep_mpr.RData')
+df_chop_mpr <- df %>% 
+                filter(Source == "CHOP")
+
+load('../data/analysis_prep_combined.RData')
+df_chop <- df %>% 
+              filter(Source == "CHOP")
+df_enigma <- df %>% 
+              filter(Source == "ENIGMA")
+
+# Revision: 07/21/2026 - Add race/ethnicity
+df_race <- read_csv("../data/CHOP/race_ethnicity_07212026.csv") %>% distinct()
+df_chop <- left_join(df_chop %>% select(-race), df_race, by = c("participant" = "subject_id"))
+
+# Add squared-age for sensitivity analysis
+df_chop <- df_chop %>% mutate(age_days_sq = age_days**2)
+df_chop_mpr <- df_chop_mpr %>% mutate(age_days_sq = age_days**2)
+df_enigma <- df_enigma %>% mutate(age_days_sq = age_days**2)
+```
+
+## Primary Analysis: Case-Control Deviation Scores (Figure 1)
+
+### CHOP
+
+```{r}
+#| output: false
+#| label: fit-models-chop-zscore
+cov_str <- " + age_days + sex + euler"
+rand_str <- ""
+
+mpr_only_cols <- features[grepl("CT",features)]
+time_start <- Sys.time()
+res <- fit_group_comparison_models(df_chop, cov_str, features, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "zscore",
+                 mpr_only_cols = mpr_only_cols)
+time_end <- Sys.time()
+
+print(time_end - time_start)
+
+res_chop_z <- summarize_model_results(res,"predictorTRUE")
+```
+
+```{r}
+#| echo: false
+#| label: summarize-results-chop-zscore
+print_top_significant_results(res_chop_z)
+summarize_results_by_cortex(res_chop_z, caption = "Case-Control Results Grouped by Cortex in CHOP")
+```
+
+#### Generate Formatted Report Table
+
+```{r}
+#| label: define-fmt-table-function
+#| output: false
+fmt_table <- function(res) {
+  res_fmt <- res %>% 
+                  select(label, contains("Cohens_d"),statistic, std.error,
+                         starts_with("p."), Case, Control) %>%
+                  mutate(label = case_match(label,
+                                            "Cerebellum.all" ~ "Cerebellum",
+                                            "SUBC.Left_Accumbens.area" ~ "SUBC.Left_Accumbens",
+                                            "SUBC.Right_Accumbens.area" ~ "SUBC.Right_Accumbens",
+                                            .default = label)) %>%
+                  separate_wider_delim(label, delim = ".", names = c("IDP Group", "IDP"),
+                                       too_few = "align_end") %>%
+                  mutate(`IDP Group` = ifelse(is.na(`IDP Group`), "Global", `IDP Group`),
+                         `IDP Group` = factor(`IDP Group`, levels = c("Global","SUBC","GM","SA","CT")),
+                         across(contains("Cohens"), ~ round(.x, 2)),
+                         across(starts_with("p."), ~ signif(.x, digits = 3)),
+                         statistic = round(statistic, 2),
+                         std.error = round(std.error, 2),
+                         `Cohen's d (95% CI)` = glue("[{Cohens_d_ci_lo} to {Cohens_d_ci_hi}]")) %>%
+                  select(-c(Cohens_d_ci_lo,Cohens_d_ci_hi)) %>%
+                  relocate(`Cohen's d (95% CI)`, .after = Cohens_d) %>%
+                  rename(`Cohen's d` = Cohens_d,
+                         Statistic = statistic,
+                         `Std Error` = std.error,
+                         p = p.value,
+                         `p (FDR)` = p.fdr,
+                         `N case` = Case,
+                         `N control` = Control) %>%
+                  arrange(`IDP Group`, IDP)
+  return(res_fmt)
+}
+```
+
+```{r}
+#| label: save-table-chop-zscore
+#| output: false
+table_fmt <- fmt_table(res_chop_z)
+dir.create("../tables/formatted/", recursive = T)
+write_csv(table_fmt, "../tables/formatted/table_s03.csv")
+```
+
+### ENIGMA
+
+```{r}
+#| output: false
+#| label: fit-models-enigma-zscore
+cov_str <- " + age_days + sex + euler"
+rand_str <- ""
+
+mpr_only_cols <- c()
+
+res <- fit_group_comparison_models(df_enigma, cov_str, features, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "zscore",
+                 mpr_only_cols = mpr_only_cols)
+
+res_enigma_z <- summarize_model_results(res,"predictorTRUE")
+```
+
+```{r}
+#| echo: false
+#| label: summarize-results-enigma-zscore
+print_top_significant_results(res_enigma_z)
+summarize_results_by_cortex(res_enigma_z, caption = "Case-Control Results Grouped by Cortex in ENIGMA")
+```
+
+#### Generate Formatted Report Table
+
+```{r}
+#| label: save-table-enigma-zscore
+#| output: false
+table_fmt <- fmt_table(res_enigma_z)
+write_csv(table_fmt, "../tables/formatted/table_s04.csv")
+```
+
+### Permutation Test
+
+#### CHOP
+
+```{r}
+#| label: define-permutation-parameters-zscore
+#| output: false
+# Define cluster parameters
+n_cores <- 72
+n_perm = 1000
+
+# Define perm features
+perm_features <- features[startsWith(features,"CT.") | startsWith(features,"GM.") | startsWith(features,"SA.")]
+```
+
+```{r}
+#| label: run-permutation-test-chop-zscore
+#| output: false
+perms <- freedman_lane_perm(df_chop, perm_features, n_perm = n_perm, n_core = n_cores, suf = "Transformed.q.zscore")
+
+true_brain_map <- res_chop_z %>% select(label, Cohens_d)
+comp_brain_map <- res_enigma_z %>% select(label, Cohens_d)
+
+res <- freedman_lane_corr_test(true_brain_map, perms, comp_brain_map)
+```
+
+### Generate Plots
+
+```{r}
+#| label: define-plot-params-zscore
+#| output: false
+fill_col <- "Cohens_d"
+ci_lo_col <- "Cohens_d_ci_lo"
+ci_hi_col <- "Cohens_d_ci_hi"
+sig_col  <- "sig"
+colorbar_title <- "Cohen's d"
+max_lim <- ceiling(max(abs(res_chop_z$Cohens_d), abs(res_enigma_z$Cohens_d))*10)/10
+plot_lims <- c(-1*ceiling(10*max_lim)/10,ceiling(10*max_lim)/10)
+
+max_lim_main <- ceiling(max(abs(res_chop_z$Cohens_d))*10)/10
+plot_lims_main <- c(-1*max_lim_main,max_lim_main)
+```
+
+```{r}
+#| output: false
+#| label: build-brain-maps-zscore
+
+p_chop_z <- assemble_main_figure_layout(res_chop_z, df_chop, fill_col, color_scheme, plot_lims,
+                 plot_type = "zscore", colorbar_title = colorbar_title,sig_col = sig_col,
+                 formatted = T)
+
+p_enigma_z <- assemble_main_figure_layout(res_enigma_z, df_enigma, fill_col, color_scheme, plot_lims,
+                 plot_type = "zscore", colorbar_title = colorbar_title,sig_col = sig_col,
+                 formatted = T)
+```
+
+```{r}
+#| label: build-main-figure-and-corr-plot-zscore
+#| output: false
+
+p_chop_z_main <- assemble_main_figure_layout(res_chop_z, df_chop, fill_col, color_scheme, plot_lims_main,
+                 plot_type = "zscore", colorbar_title = colorbar_title,sig_col = sig_col,
+                 formatted = T)
+
+tmp <- inner_join(res_chop_z %>% select(label, Cohens_d),
+           res_enigma_z %>% select(label, Cohens_d),
+           by = "label") %>%
+      filter(grepl("GM\\.|SA\\.|CT\\.",label)) %>%
+      separate_wider_delim(label, delim = ".", names = c("measure","label")) %>%
+      left_join(res) %>%
+      mutate(measure = factor(measure, levels = c("GM","SA","CT"),
+                              labels = c("Gray Matter Volume", "Surface Area", "Cortical Thickness")),
+             corr = as.character(round(corr,2)),
+             pval = as.character(round(pval,4)),
+             label_text = paste0(
+                              "r == ", corr,
+                              "~','~p[perm] == ", pval),
+             label_text = str_replace_all(label_text, "== 0$", "< 0.001"),
+             label_text = ifelse(label == "lh_bankssts",label_text, ""))
+
+p_corr <- ggplot(tmp, aes(x = Cohens_d.x, y = Cohens_d.y)) + 
+              geom_point() + # geom_smooth(method = "lm", se = F) +
+              geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+              facet_wrap(~ measure, nrow = 1) +
+              theme_pubr() +
+              # coord_fixed(ratio = 1) +
+              xlab("Cohen's d (CHOP)") +
+              ylab("Cohen's d (ENIGMA)") +
+              geom_text(aes(label = label_text, x=-0.7, y=0.95), parse = T, size = annotation_pt(7)) # +
+```
+
+```{r, fig.width = 6.69, fig.height = 7.5}
+#| echo: false
+#| label: chop-effect
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the CHOP cohort."
+
+ggarrange(p_chop_z_main, p_corr + figure_theme, ncol = 1, heights = c(5, 2.5),
+          labels = c("","D"), font.label = list(size = 10, face = "bold", color = "black"))
+dir.create("../figures_final/png/", recursive = T, showWarnings = F)
+dir.create("../figures_final/pdf/", recursive = T, showWarnings = F)
+ggsave("../figures_final/png/figure_1_case_control_chop.png", bg = 'white', dpi = 600)
+ggsave("../figures_final/pdf/figure_1_case_control_chop.pdf", bg = 'white')
+```
+
+```{r, fig.width = 6.69, fig.height = 7.5}
+#| echo: false
+#| label: enigma-effect
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the ENIGMA Cohort."
+ggarrange(p_enigma_z, p_corr, ncol = 1, heights = c(1, 0.5),
+          labels = c("","D)"))
+ggsave("../figures_final/png/figure_s3_case_control_enigma.png", bg = 'white')
+ggsave("../figures_final/pdf/figure_s3_case_control_enigma.pdf", bg = 'white')
+```
+
+#### Combine Plots
+
+```{r, fig.width = 6.69, fig.height = 12.1}
+#| label: combine-plots-zscore
+#| fig-cap: "Combined CHOP and ENIGMA case-control effect sizes (Cohen's d) for normative deviation z-scores, with between-cohort permutation-test correlations."
+t1 <- ggdraw() + 
+  draw_label("CHOP", x = 0.01, hjust = 0, fontface = "bold")
+t2 <- ggdraw() + 
+  draw_label("ENGIMA", x = 0.01, hjust = 0, fontface = "bold")
+
+gm_text <- glue('Gray Matter Volume: r = {round(res[res$measure == "GM","corr"][[1]],2)}, p = {round(res[res$measure == "GM","pval"][[1]],4)}')
+sa_text <- glue('Surface Area: r = {round(res[res$measure == "SA","corr"][[1]],2)}, p = {round(res[res$measure == "SA","pval"][[1]],4)}')
+ct_text <- glue('Cortical Thickness: r = {round(res[res$measure == "CT","corr"][[1]],2)}, p = {round(res[res$measure == "CT","pval"][[1]],4)}')
+
+caption <- ggdraw() + 
+              draw_label(glue('{gm_text} | {sa_text} | {ct_text}'))
+
+p <- ggarrange(t1, t2, p_chop_z, p_enigma_z, nrow = 4, heights = c(0.08,1,0.08,1))
+ggarrange(p, caption, heights = c(11.6,0.5), ncol = 1)
+dir.create("../figures_final/")
+```
+
+### Save Effect-Size Tables for Downstream Scripts
+
+```{r}
+#| label: save-results-zscore
+#| output: false
+write_csv(res_chop_z, "../tables/chop_cohens.csv")
+write_csv(res_enigma_z, "../tables/enigma_cohens.csv")
+```
+
+## Sensitivity Analysis: Adjusting for Intracranial Volume (Figure S6)
+
+*Sensitivity analysis: covarying for intracranial-volume (eTIV) deviation score.*
+
+### CHOP
+
+```{r}
+#| output: false
+#| label: fit-models-chop-etiv
+cov_str <- " + age_days + sex + euler + eTIVTransformed.q.zscore"
+rand_str <- ""
+
+mpr_only_cols <- features[grepl("CT",features)]
+
+res <- fit_group_comparison_models(df_chop, cov_str, features, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "zscore",
+                 mpr_only_cols = mpr_only_cols)
+
+res_chop_etiv <- summarize_model_results(res,"predictorTRUE")
+```
+
+```{r}
+#| echo: false
+#| label: summarize-results-chop-etiv
+print_top_significant_results(res_chop_etiv)
+summarize_results_by_cortex(res_chop_etiv, caption = "Case-Control Results Grouped by Cortex in CHOP")
+```
+
+#### Generate Formatted Report Table
+
+```{r}
+#| label: save-table-chop-etiv
+#| output: false
+table_fmt <- fmt_table(res_chop_etiv)
+write_csv(table_fmt, "../tables/formatted/table_s05.csv")
+```
+
+### ENIGMA
+
+```{r}
+#| output: false
+#| label: fit-models-enigma-etiv
+
+mpr_only_cols <- c()
+
+res <- fit_group_comparison_models(df_enigma, cov_str, features, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "zscore",
+                 mpr_only_cols = mpr_only_cols)
+
+res_enigma_etiv <- summarize_model_results(res,"predictorTRUE")
+```
+
+```{r}
+#| echo: false
+#| label: summarize-results-enigma-etiv
+print_top_significant_results(res_enigma_etiv)
+summarize_results_by_cortex(res_enigma_etiv, caption = "Case-Control Results Grouped by Cortex in ENIGMA")
+```
+
+#### Generate Formatted Report Table
+
+```{r}
+#| label: save-table-enigma-etiv
+#| output: false
+table_fmt <- fmt_table(res_enigma_etiv)
+write_csv(table_fmt, "../tables/formatted/table_s06.csv")
+```
+
+### Permutation Test
+
+#### Generate CHOP Permutations
+
+```{r}
+#| label: run-permutation-test-etiv
+#| output: false
+# ADDITIONAL COVS
+perms <- freedman_lane_perm(df_chop, perm_features, n_perm = n_perm, 
+                            n_core = n_cores, suf = "Transformed.q.zscore",
+                            covs = "age_days + sex + euler + eTIVTransformed.q.zscore")
+
+true_brain_map <- res_chop_etiv %>% select(label, Cohens_d)
+comp_brain_map <- res_enigma_etiv %>% select(label, Cohens_d)
+
+res <- freedman_lane_corr_test(true_brain_map, perms, comp_brain_map)
+```
+
+### Generate Plots
+
+```{r}
+#| label: define-plot-params-etiv
+#| output: false
+fill_col <- "Cohens_d"
+ci_lo_col <- "Cohens_d_ci_lo"
+ci_hi_col <- "Cohens_d_ci_hi"
+sig_col  <- "sig"
+colorbar_title <- "Cohen's d"
+max_lim <- max(abs(res_chop_etiv$Cohens_d), abs(res_enigma_etiv$Cohens_d))
+plot_lims <- c(-1*ceiling(10*max_lim)/10,ceiling(10*max_lim)/10)
+```
+
+```{r}
+#| output: false
+#| label: build-brain-maps-etiv
+
+p_chop_etiv <- assemble_main_figure_layout(res_chop_etiv, df_chop, fill_col, color_scheme, plot_lims,
+                 plot_type = "zscore", colorbar_title = colorbar_title,sig_col = sig_col)
+
+p_enigma_etiv <- assemble_main_figure_layout(res_enigma_etiv, df_enigma, fill_col, 
+                               color_scheme, plot_lims,plot_type = "zscore",
+                               colorbar_title = colorbar_title,sig_col = sig_col)
+```
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| echo: false
+#| label: chop-effect-etiv
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the CHOP cohort."
+p_chop_etiv
+```
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| echo: false
+#| label: enigma-effect-etiv
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the ENIGMA Cohort."
+p_enigma_etiv
+```
+
+#### Combine Plots
+
+```{r, fig.width = 6.69, fig.height = 11}
+#| label: combine-plots-etiv
+#| fig-cap: "Combined CHOP and ENIGMA case-control effect sizes (Cohen's d) covarying for intracranial volume (eTIV), with between-cohort permutation-test correlations."
+t1 <- ggdraw() + 
+  draw_label("CHOP", x = 0.01, hjust = 0, fontface = "bold")
+t2 <- ggdraw() + 
+  draw_label("ENGIMA", x = 0.01, hjust = 0, fontface = "bold")
+
+gm_text <- glue('Gray Matter Volume: r = {round(res[res$measure == "GM","corr"][[1]],2)}, p = {round(res[res$measure == "GM","pval"][[1]],4)}')
+sa_text <- glue('Surface Area: r = {round(res[res$measure == "SA","corr"][[1]],2)}, p = {round(res[res$measure == "SA","pval"][[1]],4)}')
+ct_text <- glue('Cortical Thickness: r = {round(res[res$measure == "CT","corr"][[1]],2)}, p = {round(res[res$measure == "CT","pval"][[1]],4)}')
+
+caption <- ggdraw() + 
+              draw_label(glue('{gm_text} | {sa_text} | {ct_text}'), size = base_font) + figure_theme
+
+p <- ggarrange(t1, p_chop_etiv, t2, p_enigma_etiv, nrow = 4, heights = c(0.08,1,0.08,1))
+ggarrange(p, caption, heights = c(11.6,0.5), ncol = 1)
+dir.create("../figures_final/")
+ggsave("../figures_final/png/figure_s6_sensitivity_icv.png", bg = 'white')
+ggsave("../figures_final/pdf/figure_s6_sensitivity_icv.pdf", bg = 'white')
+```
+
+### Describe Changes
+
+```{r}
+#| label: describe-changes-etiv
+# --- swap this to summarize a different sensitivity result -------------------
+res_test <- res_chop_etiv    # tibble to summarize
+res_ref  <- res_chop_z       # reference (primary) result to compare against
+# -----------------------------------------------------------------------------
+
+summarize_model_changes(res_test, res_ref)
+```
+
+## 
+
+## Sensitivity Analysis: High-Resolution MPRAGE Scans Only (Figure S17)
+
+### CHOP
+
+```{r}
+#| output: false
+#| label: fit-models-chop-mprage
+cov_str <- " + age_days + sex + euler"
+rand_str <- ""
+
+mpr_only_cols <- c()
+
+res <- fit_group_comparison_models(df_chop_mpr, cov_str, features, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "zscore",
+                 mpr_only_cols = mpr_only_cols)
+
+res_chop_mpr <- summarize_model_results(res,"predictorTRUE")
+```
+
+```{r}
+#| echo: false
+#| label: summarize-results-chop-mprage
+print_top_significant_results(res_chop_mpr)
+summarize_results_by_cortex(res_chop_mpr, caption = "Case-Control Results Grouped by Cortex in CHOP")
+```
+
+#### Generate Formatted Report Table
+
+```{r}
+#| label: save-table-chop-mprage
+#| output: false
+table_fmt <- fmt_table(res_chop_mpr)
+write_csv(table_fmt, "../tables/formatted/table_s6.csv")
+```
+
+### Permutation Test
+
+#### Generate CHOP Permutations
+
+```{r}
+#| label: run-permutation-test-mprage
+#| output: false
+perms <- freedman_lane_perm(df_chop_mpr, perm_features, n_perm = n_perm, n_core = n_cores, suf = "Transformed.q.zscore")
+
+true_brain_map <- res_chop_mpr %>% select(label, Cohens_d)
+comp_brain_map <- res_enigma_z %>% select(label, Cohens_d)
+
+res <- freedman_lane_corr_test(true_brain_map, perms, comp_brain_map)
+```
+
+### Generate Plots
+
+```{r}
+#| label: define-plot-params-mprage
+#| output: false
+fill_col <- "Cohens_d"
+ci_lo_col <- "Cohens_d_ci_lo"
+ci_hi_col <- "Cohens_d_ci_hi"
+sig_col  <- "sig"
+colorbar_title <- "Cohen's d"
+max_lim <- max(abs(res_chop_mpr$Cohens_d), abs(res_enigma_z$Cohens_d))
+plot_lims <- c(-1*ceiling(10*max_lim)/10,ceiling(10*max_lim)/10)
+```
+
+```{r}
+#| output: false
+#| label: build-brain-map-mprage
+
+p_chop_mpr <- assemble_main_figure_layout(res_chop_mpr, df_chop_mpr, fill_col, color_scheme, plot_lims,
+                 plot_type = "zscore", colorbar_title = colorbar_title,sig_col = sig_col)
+```
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| echo: false
+#| label: chop-effect-mprage
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the CHOP cohort (MPRAGE only)."
+p_chop_mpr
+```
+
+#### Combine Plots
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| label: combine-plots-mprage
+#| echo: false
+#| fig-cap: "Case-control effect sizes (Cohen's d) in the CHOP cohort restricted to MPRAGE acquisitions."
+p_chop_mpr
+dir.create("../figures_final/")
+ggsave("../figures_final/png/figure_s17_sensitivity_mprage.png", bg = 'white')
+ggsave("../figures_final/pdf/figure_s17_sensitivity_mprage.pdf", bg = 'white')
+```
+
+### Describe Changes
+
+```{r}
+#| label: describe-changes-mprage
+# --- swap this to summarize a different sensitivity result -------------------
+res_test <- res_chop_mpr    # tibble to summarize
+res_ref  <- res_chop_z       # reference (primary) result to compare against
+# -----------------------------------------------------------------------------
+
+summarize_model_changes(res_test, res_ref)
+```
+
+## Sensitivity Analysis: Brain Centiles Instead of Deviation Scores (Figure S18)
+
+*Sensitivity analysis: raw centiles in place of normative deviation (z-)scores.*
+
+### CHOP
+
+```{r}
+#| output: false
+#| label: fit-models-chop-centile
+cov_str <- " + age_days + sex + euler"
+rand_str <- ""
+
+mpr_only_cols <- features[grepl("CT",features)]
+
+res <- fit_group_comparison_models(df_chop, cov_str, features, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "centile",
+                 mpr_only_cols = mpr_only_cols)
+
+res_chop <- summarize_model_results(res,"predictorTRUE")
+```
+
+```{r}
+#| echo: false
+#| label: summarize-results-chop-centile
+print_top_significant_results(res_chop)
+summarize_results_by_cortex(res_chop, caption = "Case-Control Results Grouped by Cortex in CHOP")
+```
+
+#### Generate Formatted Report Table
+
+```{r}
+#| label: save-table-chop-centile
+#| output: false
+table_fmt <- fmt_table(res_chop)
+write_csv(table_fmt, "../tables/formatted/table_s17.csv")
+```
+
+### ENIGMA
+
+```{r}
+#| output: false
+#| label: fit-models-enigma-centile
+cov_str <- " + age_days + sex + euler"
+rand_str <- ""
+
+mpr_only_cols <- c()
+
+res <- fit_group_comparison_models(df_enigma, cov_str, features, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "centile",
+                 mpr_only_cols = mpr_only_cols)
+
+res_enigma <- summarize_model_results(res,"predictorTRUE")
+```
+
+```{r}
+#| echo: false
+#| label: summarize-results-enigma-centile
+print_top_significant_results(res_enigma)
+summarize_results_by_cortex(res_enigma, caption = "Case-Control Results Grouped by Cortex in ENIGMA")
+```
+
+#### Generate Formatted Report Table
+
+```{r}
+#| label: save-table-enigma-centile
+#| output: false
+table_fmt <- fmt_table(res_enigma)
+write_csv(table_fmt, "../tables/formatted/table_s18.csv")
+```
+
+### Permutation Test
+
+#### Generate CHOP Permutations
+
+```{r}
+#| label: run-permutation-test-centile
+#| output: false
+perms <- freedman_lane_perm(df_chop, perm_features, n_perm = n_perm, n_core = n_cores, suf = "Transformed.q.wre")
+
+true_brain_map <- res_chop %>% select(label, Cohens_d)
+comp_brain_map <- res_enigma %>% select(label, Cohens_d)
+
+res <- freedman_lane_corr_test(true_brain_map, perms, comp_brain_map)
+```
+
+### Generate Plots
+
+```{r}
+#| label: define-plot-params-centile
+#| output: false
+fill_col <- "Cohens_d"
+ci_lo_col <- "Cohens_d_ci_lo"
+ci_hi_col <- "Cohens_d_ci_hi"
+sig_col  <- "sig"
+colorbar_title <- "Cohen's d "
+max_lim <- max(abs(res_chop$Cohens_d), abs(res_enigma$Cohens_d))
+plot_lims <- c(-1*ceiling(10*max_lim)/10,ceiling(10*max_lim)/10)
+```
+
+```{r}
+#| output: false
+#| label: build-brain-maps-centile
+
+p_chop <- assemble_main_figure_layout(res_chop, df_chop, fill_col, color_scheme, plot_lims,
+                 plot_type = "centile", colorbar_title = colorbar_title,sig_col = sig_col)
+
+p_enigma <- assemble_main_figure_layout(res_enigma, df_enigma, fill_col, color_scheme, plot_lims,
+                 plot_type = "centile", colorbar_title = colorbar_title,sig_col = sig_col)
+```
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| echo: false
+#| label: chop-effect-centile
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the CHOP cohort."
+p_chop
+```
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| echo: false
+#| label: enigma-effect-centile
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the ENIGMA Cohort."
+p_enigma
+```
+
+#### Combine Plots
+
+```{r, fig.width = 6.69, fig.height = 12.1}
+#| label: combine-plots-centile
+#| fig-cap: "Combined CHOP and ENIGMA case-control effect sizes (Cohen's d) using raw centile scores, with between-cohort permutation-test correlations."
+t1 <- ggdraw() + 
+  draw_label("CHOP", x = 0.01, hjust = 0, fontface = "bold")
+t2 <- ggdraw() + 
+  draw_label("ENGIMA", x = 0.01, hjust = 0, fontface = "bold")
+
+gm_text <- glue('Gray Matter Volume: r = {round(res[res$measure == "GM","corr"][[1]],2)}, p = {round(res[res$measure == "GM","pval"][[1]],4)}')
+sa_text <- glue('Surface Area: r = {round(res[res$measure == "SA","corr"][[1]],2)}, p = {round(res[res$measure == "SA","pval"][[1]],4)}')
+ct_text <- glue('Cortical Thickness: r = {round(res[res$measure == "CT","corr"][[1]],2)}, p = {round(res[res$measure == "CT","pval"][[1]],4)}')
+
+caption <- ggdraw() + 
+              draw_label(glue('{gm_text} | {sa_text} | {ct_text}'), size = base_font) + figure_theme
+
+p <- ggarrange(t1, p_chop, t2, p_enigma, nrow = 4, heights = c(0.08,1,0.08,1))
+ggarrange(p, caption, heights = c(11.6,0.5), ncol = 1)
+dir.create("../figures_final/")
+ggsave("../figures_final/png/figure_s18_sensitivity_centiles.png", bg = 'white')
+ggsave("../figures_final/pdf/figure_s18_sensitivity_centiles.pdf", bg = 'white')
+```
+
+### Describe Changes
+
+```{r}
+#| label: describe-changes-centile
+# --- swap this to summarize a different sensitivity result -------------------
+res_test <- res_chop    # tibble to summarize
+res_ref  <- res_chop_z       # reference (primary) result to compare against
+# -----------------------------------------------------------------------------
+
+# summarize_model_changes() is defined in utils.R
+summarize_model_changes(res_test, res_ref)
+```
+
+## Sensitivity Analysis: Non-Benchmarked Brain Features (Figure S19)
+
+*Sensitivity analysis: raw (non-benchmarked) volume/surface-area/thickness features in place of centiles.*
+
+```{r}
+#| label: define-feature-groups-idp
+#| output: false
+features.sa <- c(features[startsWith(features,"SA.")],"totalSA")
+features.ct <- c(features[startsWith(features,"CT.")],"meanCT")
+features.gm <- features[!(features %in% c(features.sa, features.ct))]
+```
+
+### CHOP
+
+```{r}
+#| output: false
+#| label: fit-models-chop-idp
+rand_str <- ""
+
+cov.gm <- " + age_days + age_days_sq  + sex + euler"
+res.gm <- fit_group_comparison_models(df_chop, cov.gm, features.gm, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "volume")
+
+cov.ct <- " + age_days_sq + sex + euler_mpr"
+res.ct <- fit_group_comparison_models(df_chop, cov.ct, features.ct, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "volume")
+
+cov.sa <- " + age_days + sex + euler"
+res.sa <- fit_group_comparison_models(df_chop, cov.sa, features.sa, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "volume")
+
+res <- bind_rows(res.gm, res.ct, res.sa)
+
+
+res_chop_vol <- summarize_model_results(res,"predictorTRUE")
+```
+
+```{r}
+#| echo: false
+#| label: summarize-results-chop-idp
+print_top_significant_results(res_chop_vol)
+summarize_results_by_cortex(res_chop_vol, caption = "Case-Control Results Grouped by Cortex in CHOP")
+```
+
+#### Generate Formatted Report Table
+
+```{r}
+#| label: save-table-chop-idp
+#| output: false
+
+res_chop_vol <- res_chop_vol %>% 
+                  arrange(match(label, res_chop_z$label))
+table_fmt <- fmt_table(res_chop_vol)
+write_csv(table_fmt, "../tables/formatted/table_s19.csv")
+```
+
+### ENIGMA
+
+```{r}
+#| output: false
+#| label: fit-models-enigma-idp
+rand_str <- ""
+
+cov.gm <- " + age_days + age_days_sq  + sex + euler"
+res.gm <- fit_group_comparison_models(df_enigma, cov.gm, features.gm, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "volume")
+
+cov.ct <- " + age_days_sq + sex + euler"
+res.ct <- fit_group_comparison_models(df_enigma, cov.ct, features.ct, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "volume")
+
+cov.sa <- " + age_days + sex + euler"
+res.sa <- fit_group_comparison_models(df_enigma, cov.sa, features.sa, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "volume")
+
+res <- bind_rows(res.gm, res.ct, res.sa)
+
+res_enigma_vol <- summarize_model_results(res,"predictorTRUE")
+```
+
+```{r}
+#| echo: false
+#| label: summarize-results-enigma-idp
+print_top_significant_results(res_enigma_vol)
+summarize_results_by_cortex(res_enigma_vol, caption = "Case-Control Results Grouped by Cortex in ENIGMA")
+```
+
+#### Generate Formatted Report Table
+
+```{r}
+#| label: save-table-enigma-idp
+#| output: false
+
+res_enigma_vol <- res_enigma_vol %>% 
+                  arrange(match(label, res_enigma_z$label))
+table_fmt <- fmt_table(res_enigma_vol)
+write_csv(table_fmt, "../tables/formatted/table_s20.csv")
+```
+
+### Permutation Test
+
+#### Generate CHOP Permutations
+
+```{r}
+#| label: run-permutation-test-idp
+#| output: false
+# THIS ONE NEEDS ADDITIONAL COVARIATES
+cov.gm <- "age_days + age_days_sq  + sex + euler"
+cov.ct <- "age_days_sq + sex + euler"
+cov.sa <- "age_days + sex + euler"
+
+feat.gm <- perm_features[grepl("GM\\.", perm_features)]
+feat.sa <- perm_features[grepl("SA\\.", perm_features)]
+feat.ct <- perm_features[grepl("CT\\.", perm_features)]
+
+perms.gm <- freedman_lane_perm(df_chop, feat.gm, n_perm = n_perm, n_core = n_cores, suf = "Transformed.normalised", covs = cov.gm)
+perms.sa <- freedman_lane_perm(df_chop, feat.sa, n_perm = n_perm, n_core = n_cores, suf = "Transformed.normalised", covs = cov.sa)
+perms.ct <- freedman_lane_perm(df_chop, feat.ct, n_perm = n_perm, n_core = n_cores, suf = "Transformed.normalised", covs = cov.ct)
+
+perms <- bind_rows(perms.gm, perms.sa, perms.ct)
+
+true_brain_map <- res_chop_vol %>% select(label, Cohens_d)
+comp_brain_map <- res_enigma_vol %>% select(label, Cohens_d)
+
+res <- freedman_lane_corr_test(true_brain_map, perms, comp_brain_map)
+```
+
+### Generate Plots
+
+```{r}
+#| label: define-plot-params-idp
+#| output: false
+fill_col <- "Cohens_d"
+ci_lo_col <- "Cohens_d_ci_lo"
+ci_hi_col <- "Cohens_d_ci_hi"
+sig_col  <- "sig"
+colorbar_title <- "Cohen's d"
+max_lim <- max(abs(res_chop_vol$Cohens_d), abs(res_enigma_vol$Cohens_d))
+plot_lims <- c(-1*ceiling(10*max_lim)/10,ceiling(10*max_lim)/10)
+plot_lims <- c(-1*ceiling(10*max_lim)/10,ceiling(10*max_lim)/10)
+```
+
+```{r}
+#| output: false
+#| label: build-brain-maps-idp
+
+p_chop_vol <- assemble_main_figure_layout(res_chop_vol, df_chop, fill_col, color_scheme, plot_lims,
+                 plot_type = "volume", colorbar_title = colorbar_title,sig_col = sig_col,
+                 bar_global = T)
+
+p_enigma_vol <- assemble_main_figure_layout(res_enigma_vol, df_enigma, fill_col, color_scheme, 
+                              plot_lims,plot_type = "volume", 
+                              colorbar_title = colorbar_title,sig_col = sig_col,
+                 bar_global = T)
+```
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| echo: false
+#| label: chop-effect-idp
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the CHOP cohort."
+p_chop_vol
+```
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| echo: false
+#| label: enigma-effect-idp
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the ENIGMA Cohort."
+p_enigma_vol
+```
+
+#### Combine Plots
+
+```{r, fig.width = 6.69, fig.height = 11}
+#| label: combine-plots-idp
+#| fig-cap: "Combined CHOP and ENIGMA case-control effect sizes (Cohen's d) using non-benchmarked volume, surface area and cortical thickness measures, with between-cohort permutation-test correlations."
+t1 <- ggdraw() + 
+  draw_label("CHOP", x = 0.01, hjust = 0, fontface = "bold")
+t2 <- ggdraw() + 
+  draw_label("ENGIMA", x = 0.01, hjust = 0, fontface = "bold")
+
+gm_text <- glue('Gray Matter Volume: r = {round(res[res$measure == "GM","corr"][[1]],2)}, p = {round(res[res$measure == "GM","pval"][[1]],4)}')
+sa_text <- glue('Surface Area: r = {round(res[res$measure == "SA","corr"][[1]],2)}, p = {round(res[res$measure == "SA","pval"][[1]],4)}')
+ct_text <- glue('Cortical Thickness: r = {round(res[res$measure == "CT","corr"][[1]],2)}, p = {round(res[res$measure == "CT","pval"][[1]],4)}')
+
+caption <- ggdraw() + 
+              draw_label(glue('{gm_text} | {sa_text} | {ct_text}'), size = base_font) + figure_theme
+
+p <- ggarrange(t1, p_chop_vol, t2, p_enigma_vol, nrow = 4, heights = c(0.08,1,0.08,1))
+ggarrange(p, caption, heights = c(11.6,0.5), ncol = 1)
+dir.create("../figures_final/")
+ggsave("../figures_final/png/figure_s19_sensitivity_nonbenchmarked.png", bg = 'white')
+ggsave("../figures_final/pdf/figure_s19_sensitivity_nonbenchmarked.pdf", bg = 'white')
+```
+
+### Describe Changes
+
+```{r}
+#| label: describe-changes-idp
+# --- swap this to summarize a different sensitivity result -------------------
+res_test <- res_chop_vol    # tibble to summarize
+res_ref  <- res_chop_z       # reference (primary) result to compare against
+# -----------------------------------------------------------------------------
+
+# precompute the three row-wise comparisons (res_test and res_ref must be row-aligned)
+sign_consistent <- sign(res_test$Cohens_d) == sign(res_ref$Cohens_d)
+test_sig        <- res_test$sig == "p.fdr < 0.05"
+sig_matches     <- res_test$sig == res_ref$sig
+
+res_summary <- tibble::tibble(
+  category = c(
+    "Significant and directionally consistent",
+    "Significant but directionally different",
+    "No longer significant, but directionally consistent",
+    "No longer significant and directionally different",
+    "Newly significant, but directionally consistent",
+    "Newly significant and directionally different",
+    "Never significant and not directionally consistent",
+    "Never significant, but directionally consistent"
+  ),
+  count = c(
+    sum(sign_consistent  & test_sig  & sig_matches,  na.rm = TRUE),
+    sum(!sign_consistent & test_sig  & sig_matches,  na.rm = TRUE),
+    sum(sign_consistent  & !test_sig & !sig_matches, na.rm = TRUE),
+    sum(!sign_consistent & !test_sig & !sig_matches, na.rm = TRUE),
+    sum(sign_consistent  & test_sig  & !sig_matches, na.rm = TRUE),
+    sum(!sign_consistent & test_sig  & !sig_matches, na.rm = TRUE),
+    sum(!sign_consistent & !test_sig & sig_matches,  na.rm = TRUE),
+    sum(sign_consistent  & !test_sig & sig_matches,  na.rm = TRUE)
+  )
+)
+
+res_summary
+```
+
+## Sensitivity Analysis: Including Scans with Pathology (Figure S20)
+
+```{r}
+#| label: build-pathology-dataset
+#| output: false
+df_tmp <- abnormal_pathology %>% filter(!(participant %in% df_chop$participant))
+df_chop_path <- bind_rows(df_chop, df_tmp)
+```
+
+### CHOP
+
+```{r}
+#| output: false
+#| label: fit-models-chop-pathology
+cov_str <- " + age_days + sex + euler"
+rand_str <- ""
+
+mpr_only_cols <- features[grepl("CT",features)]
+
+res <- fit_group_comparison_models(df_chop_path, cov_str, features, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "zscore",
+                 mpr_only_cols = mpr_only_cols)
+
+res_chop_path <- summarize_model_results(res,"predictorTRUE")
+```
+
+```{r}
+#| echo: false
+#| label: summarize-results-chop-pathology
+print_top_significant_results(res_chop_path)
+summarize_results_by_cortex(res_chop_path, caption = "Case-Control Results Grouped by Cortex in CHOP")
+```
+
+#### Generate Formatted Report Table
+
+```{r}
+#| label: save-table-chop-pathology
+#| output: false
+table_fmt <- fmt_table(res_chop_path)
+write_csv(table_fmt, "../tables/formatted/table_s21.csv")
+```
+
+### Permutation Test
+
+#### Generate CHOP Permutations
+
+```{r}
+#| label: run-permutation-test-pathology
+#| output: false
+perms <- freedman_lane_perm(df_chop_path, perm_features, n_perm = n_perm, n_core = n_cores, suf = "Transformed.q.zscore")
+
+true_brain_map <- res_chop_path %>% select(label, Cohens_d)
+comp_brain_map <- res_enigma_z %>% select(label, Cohens_d)
+
+res <- freedman_lane_corr_test(true_brain_map, perms, comp_brain_map)
+```
+
+### Generate Plots
+
+```{r}
+#| label: define-plot-params-pathology
+#| output: false
+fill_col <- "Cohens_d"
+ci_lo_col <- "Cohens_d_ci_lo"
+ci_hi_col <- "Cohens_d_ci_hi"
+sig_col  <- "sig"
+colorbar_title <- "Cohen's d"
+max_lim <- max(abs(res_chop_path$Cohens_d), abs(res_enigma_z$Cohens_d))
+plot_lims <- c(-1*ceiling(10*max_lim)/10,ceiling(10*max_lim)/10)
+```
+
+```{r}
+#| output: false
+#| label: build-brain-map-pathology
+
+p_chop_path <- assemble_main_figure_layout(res_chop_path, df_chop_path, fill_col, 
+                             color_scheme, plot_lims,plot_type = "zscore", 
+                             colorbar_title = colorbar_title,sig_col = sig_col)
+```
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| echo: false
+#| label: chop-effect-pathology
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the CHOP cohort (including those with pathology)."
+p_chop_path
+```
+
+#### Combine Plots
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| label: combine-plots-pathology
+#| echo: false
+#| fig-cap: "Case-control effect sizes (Cohen's d) in the CHOP cohort including participants with abnormal pathology."
+p_chop_path
+ggsave("../figures_final/png/figure_s20_sensitivity_pathology.png", bg = 'white')
+ggsave("../figures_final/pdf/figure_s20_sensitivity_pathology.pdf", bg = 'white')
+```
+
+### Describe Changes
+
+```{r}
+#| label: describe-changes-pathology
+# --- swap this to summarize a different sensitivity result -------------------
+res_test <- res_chop_path    # tibble to summarize
+res_ref  <- res_chop_z       # reference (primary) result to compare against
+# -----------------------------------------------------------------------------
+
+summarize_model_changes(res_test, res_ref)
+```
+
+## 
+
+## Sensitivity Analysis: Scanner Covariate (Figure S21)
+
+*Sensitivity analysis: adding scanner/site as a fixed-effect covariate.*
+
+### CHOP
+
+```{r}
+#| output: false
+#| label: fit-models-chop-site
+cov_str <- " + age_days + sex + euler + site"
+rand_str <- ""
+
+mpr_only_cols <- features[grepl("CT",features)]
+
+res <- fit_group_comparison_models(df_chop, cov_str, features, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "zscore",
+                 mpr_only_cols = mpr_only_cols)
+
+res_chop_fixed <- summarize_model_results(res,"predictorTRUE")
+```
+
+```{r}
+#| echo: false
+#| label: summarize-results-chop-site
+print_top_significant_results(res_chop_fixed)
+summarize_results_by_cortex(res_chop_fixed, caption = "Case-Control Results Grouped by Cortex in CHOP")
+```
+
+#### Generate Formatted Report Table
+
+```{r}
+#| label: save-table-chop-site
+#| output: false
+table_fmt <- fmt_table(res_chop_fixed)
+write_csv(table_fmt, "../tables/formatted/table_s22.csv")
+```
+
+### ENIGMA
+
+```{r}
+#| output: false
+#| label: fit-models-enigma-site
+cov_str <- " + age_days + sex + euler + site"
+rand_str <- ""
+
+mpr_only_cols <- c()
+
+res <- fit_group_comparison_models(df_enigma, cov_str, features, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "zscore",
+                 mpr_only_cols = mpr_only_cols)
+
+res_enigma_fixed <- summarize_model_results(res,"predictorTRUE")
+```
+
+```{r}
+#| echo: false
+#| label: summarize-results-enigma-site
+print_top_significant_results(res_enigma_fixed)
+summarize_results_by_cortex(res_enigma_fixed, caption = "Case-Control Results Grouped by Cortex in ENIGMA")
+```
+
+#### Generate Formatted Report Table
+
+```{r}
+#| label: save-table-enigma-site
+#| output: false
+table_fmt <- fmt_table(res_enigma_fixed)
+write_csv(table_fmt, "../tables/formatted/table_s23.csv")
+```
+
+### Permutation Test
+
+#### Generate CHOP Permutations
+
+```{r}
+#| label: run-permutation-test-site
+#| output: false
+# ADDITIONAL COVS
+perms <- freedman_lane_perm(df_chop, perm_features, n_perm = n_perm, 
+                            n_core = n_cores, suf = "Transformed.q.zscore",
+                            covs = "age_days + sex + euler + site")
+
+true_brain_map <- res_chop_fixed %>% select(label, Cohens_d)
+comp_brain_map <- res_enigma_fixed %>% select(label, Cohens_d)
+
+res <- freedman_lane_corr_test(true_brain_map, perms, comp_brain_map)
+```
+
+### Generate Plots
+
+```{r}
+#| label: define-plot-params-site
+#| output: false
+fill_col <- "Cohens_d"
+ci_lo_col <- "Cohens_d_ci_lo"
+ci_hi_col <- "Cohens_d_ci_hi"
+sig_col  <- "sig"
+colorbar_title <- "Cohen's d"
+max_lim <- max(abs(res_chop_fixed$Cohens_d), abs(res_enigma_fixed$Cohens_d))
+plot_lims <- c(-1*ceiling(10*max_lim)/10,ceiling(10*max_lim)/10)
+```
+
+```{r}
+#| output: false
+#| label: build-brain-maps-site
+
+p_chop_fixed <- assemble_main_figure_layout(res_chop_fixed, df_chop, fill_col, color_scheme, plot_lims,
+                 plot_type = "zscore", colorbar_title = colorbar_title,sig_col = sig_col)
+
+p_enigma_fixed <- assemble_main_figure_layout(res_enigma_fixed, df_enigma, fill_col, color_scheme,
+                               plot_lims,plot_type = "zscore", 
+                               colorbar_title = colorbar_title, sig_col = sig_col)
+```
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| echo: false
+#| label: chop-effect-fixed
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the CHOP cohort (mixed effects model with random intercept for site)."
+p_chop_fixed
+```
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| echo: false
+#| label: enigma-effect-fixed
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the ENIGMA Cohort (mixed effects model with random intercept for site)."
+p_enigma_fixed
+```
+
+#### Combine Plots
+
+```{r, fig.width = 6.69, fig.height = 11}
+#| label: combine-plots-site
+#| fig-cap: "Combined CHOP and ENIGMA case-control effect sizes (Cohen's d) covarying for scanner site, with between-cohort permutation-test correlations."
+t1 <- ggdraw() + 
+  draw_label("CHOP", x = 0.01, hjust = 0, fontface = "bold")
+t2 <- ggdraw() + 
+  draw_label("ENGIMA", x = 0.01, hjust = 0, fontface = "bold")
+
+gm_text <- glue('Gray Matter Volume: r = {round(res[res$measure == "GM","corr"][[1]],2)}, p = {round(res[res$measure == "GM","pval"][[1]],4)}')
+sa_text <- glue('Surface Area: r = {round(res[res$measure == "SA","corr"][[1]],2)}, p = {round(res[res$measure == "SA","pval"][[1]],4)}')
+ct_text <- glue('Cortical Thickness: r = {round(res[res$measure == "CT","corr"][[1]],2)}, p = {round(res[res$measure == "CT","pval"][[1]],4)}')
+
+caption <- ggdraw() + 
+              draw_label(glue('{gm_text} | {sa_text} | {ct_text}'), size = base_font) + figure_theme
+              
+
+p <- ggarrange(t1, p_chop_fixed, t2, p_enigma_fixed, nrow = 4, heights = c(0.08,1,0.08,1))
+ggarrange(p, caption, heights = c(11.6,0.5), ncol = 1)
+dir.create("../figures_final/")
+ggsave("../figures_final/png/figure_s21_sensitivity_scanner.png", bg = 'white')
+ggsave("../figures_final/pdf/figure_s21_sensitivity_scanner.pdf", bg = 'white')
+```
+
+### Describe Changes
+
+```{r}
+#| label: describe-changes-site
+# --- swap this to summarize a different sensitivity result -------------------
+res_test <- res_chop_fixed    # tibble to summarize
+res_ref  <- res_chop_z       # reference (primary) result to compare against
+# -----------------------------------------------------------------------------
+
+summarize_model_changes(res_test, res_ref)
+```
+
+## Sensitivity Analysis: Participants Aged 6 Years and Older (Figure S22)
+
+```{r}
+#| label: build-age6plus-dataset
+#| output: false
+df_chop_older <- df_chop %>% filter(age_days >= (365.25*6+280))
+```
+
+### CHOP
+
+```{r}
+#| output: false
+#| label: fit-models-chop-age6plus
+cov_str <- " + age_days + sex + euler"
+rand_str <- ""
+
+mpr_only_cols <- features[grepl("CT",features)]
+res <- fit_group_comparison_models(df_chop_older, cov_str, features, rand_str = rand_str,
+                 predictor = "dx", group_control = "CN",
+                 group_case = "22q11DS", model_type = "zscore",
+                 mpr_only_cols = mpr_only_cols)
+
+res_chop_older <- summarize_model_results(res,"predictorTRUE")
+```
+
+```{r}
+#| echo: false
+#| label: summarize-results-chop-age6plus
+print_top_significant_results(res_chop_older)
+summarize_results_by_cortex(res_chop_older, caption = "Case-Control Results Grouped by Cortex in CHOP")
+```
+
+#### Generate Formatted Report Table
+
+```{r}
+#| label: save-table-chop-age6plus
+#| output: false
+table_fmt <- fmt_table(res_chop_older)
+write_csv(table_fmt, "../tables/formatted/table_s24.csv")
+```
+
+### Permutation Test
+
+#### Generate CHOP Permutations
+
+```{r}
+#| label: run-permutation-test-age6plus
+#| output: false
+perms <- freedman_lane_perm(df_chop_older, perm_features, n_perm = n_perm, n_core = n_cores, suf = "Transformed.q.zscore")
+
+true_brain_map <- res_chop_older %>% select(label, Cohens_d)
+comp_brain_map <- res_enigma %>% select(label, Cohens_d)
+
+res <- freedman_lane_corr_test(true_brain_map, perms, comp_brain_map)
+```
+
+### Generate Plots
+
+```{r}
+#| label: define-plot-params-age6plus
+#| output: false
+fill_col <- "Cohens_d"
+ci_lo_col <- "Cohens_d_ci_lo"
+ci_hi_col <- "Cohens_d_ci_hi"
+sig_col  <- "sig"
+colorbar_title <- "Cohen's d"
+max_lim <- max(abs(res_chop_older$Cohens_d), abs(res_enigma_z$Cohens_d))
+plot_lims <- c(-1*ceiling(10*max_lim)/10,ceiling(10*max_lim)/10)
+```
+
+```{r, fig.width = 6.5, fig.height = 6.5}
+#| output: false
+#| label: build-brain-map-age6plus
+
+p_chop_older <- assemble_main_figure_layout(res_chop_older, df_chop_older, fill_col,
+                             color_scheme, plot_lims,plot_type = "zscore",
+                             colorbar_title = colorbar_title,sig_col = sig_col)
+```
+
+```{r, fig.width = 8.5, fig.height = 6.5}
+#| echo: false
+#| label: chop-effect-older
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the CHOP cohort (ages 6+)."
+p_chop_older
+```
+
+#### Combine Plots
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| label: combine-plots-age6plus
+#| echo: false
+#| fig-cap: "Case-control effect sizes (Cohen's d) in the CHOP cohort restricted to participants aged 6 years and older."
+p_chop_older
+ggsave("../figures_final/png/figure_s22_sensitivity_age6plus.png", bg = 'white')
+ggsave("../figures_final/pdf/figure_s22_sensitivity_age6plus.pdf", bg = 'white')
+```
+
+### Describe Changes
+
+```{r}
+#| label: describe-changes-age6plus
+# --- swap this to summarize a different sensitivity result -------------------
+res_test <- res_chop_older    # tibble to summarize
+res_ref  <- res_chop_z       # reference (primary) result to compare against
+# -----------------------------------------------------------------------------
+
+summarize_model_changes(res_test, res_ref)
+```
+
+## Sensitivity Analysis: Self-Described Race Covariate (Figure S23)
+
+*Sensitivity analysis: covarying for self-described race.*
+
+### CHOP
+
+```{r}
+#| output: false
+#| label: fit-models-chop-race
+cov_str <- " + age_days + sex + euler + race"
+rand_str <- ""
+
+mpr_only_cols <- features[grepl("CT",features)]
+
+res <- fit_group_comparison_models(df_chop, cov_str, features, rand_str = rand_str, 
+                 predictor = "dx", group_control = "CN", 
+                 group_case = "22q11DS", model_type = "zscore",
+                 mpr_only_cols = mpr_only_cols)
+
+res_chop_race <- summarize_model_results(res,"predictorTRUE")
+```
+
+```{r}
+#| echo: false
+#| label: summarize-results-chop-race
+print_top_significant_results(res_chop_race)
+summarize_results_by_cortex(res_chop_race, caption = "Case-Control Results Grouped by Cortex in CHOP")
+```
+
+#### Generate Formatted Report Table
+
+```{r}
+#| label: save-table-chop-race
+#| output: false
+table_fmt <- fmt_table(res_chop_race)
+write_csv(table_fmt, "../tables/formatted/table_s25.csv")
+```
+
+### Generate Plots
+
+```{r}
+#| label: define-plot-params-race
+#| output: false
+fill_col <- "Cohens_d"
+ci_lo_col <- "Cohens_d_ci_lo"
+ci_hi_col <- "Cohens_d_ci_hi"
+sig_col  <- "sig"
+colorbar_title <- "Cohen's d"
+max_lim <- max(abs(res_chop_race$Cohens_d), abs(res_chop_race$Cohens_d))
+plot_lims <- c(-1*ceiling(10*max_lim)/10,ceiling(10*max_lim)/10)
+```
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| output: false
+#| label: build-brain-map-race
+
+p_chop_race <- assemble_main_figure_layout(res_chop_race, df_chop, fill_col, color_scheme, plot_lims,
+                 plot_type = "zscore", colorbar_title = colorbar_title,sig_col = sig_col)
+```
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| echo: false
+#| label: chop-effect-race
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the CHOP cohort (mixed effects model with random intercept for site)."
+p_chop_race
+```
+
+#### Combine Plots
+
+```{r, fig.width = 6.69, fig.height = 5}
+#| label: combine-plots-race
+#| echo: false
+#| fig-cap: "Case-control effect sizes (Cohen's d) in the CHOP cohort covarying for self-described race."
+p_chop_race
+ggsave("../figures_final/png/figure_s23_sensitivity_race.png", bg = 'white')
+ggsave("../figures_final/pdf/figure_s23_sensitivity_race.pdf", bg = 'white')
+```
+
+### Describe Changes
+
+```{r}
+#| label: describe-changes-race
+# --- swap this to summarize a different sensitivity result -------------------
+res_test <- res_chop_race    # tibble to summarize
+res_ref  <- res_chop_z       # reference (primary) result to compare against
+# -----------------------------------------------------------------------------
+
+summarize_model_changes(res_test, res_ref)
+```
+
+## Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

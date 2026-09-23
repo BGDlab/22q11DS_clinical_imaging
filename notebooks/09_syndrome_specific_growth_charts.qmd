@@ -1,0 +1,752 @@
+---
+title: "Syndrome-Specific (LMSz) Growth Charts (Figure 4)"
+author: "Benjamin Jung, PhD"
+format:
+  pdf:
+    documentclass: scrreprt
+    toc: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r}
+#| label: setup-libraries-and-sources
+#| output: false
+library(tidyverse)
+library(glue)
+library(gamlssTools)
+library(ggpubr)
+library(cowplot)
+library(ggseg)
+source("util_scripts/lmsz_functions.R")
+source("util_scripts/utils.R")
+# Code from https://github.com/brainchart/Lifespan/tree/main
+source("../Lifespan/102.gamlss-recode.r")
+source("../Lifespan/301.functions.r")
+set.seed(2514)
+```
+
+## Load Data
+
+```{r}
+#| label: build-age-simulation-grids
+#| output: false
+# Construct equally spaced grid of ages and sex for centile-line calculation
+sim_list <- list()
+sim_list$Male <- expand.grid(AgeTransformed = seq(log(280),log(365.25*21+280),0.01),
+                        sex = c("Male"))
+sim_list$Female <- expand.grid(AgeTransformed = seq(log(280),log(365.25*21+280),0.01),
+                        sex = c("Female"))
+```
+
+```{r}
+#| label: load-chop-analysis-data
+#| output: false
+load('../data/analysis_prep_combined.RData')
+slip_features <- read_csv("../data/CHOP/pheno_dict.csv", show_col_types = F)
+```
+
+```{r}
+#| label: build-chop-22q11ds-dataframe
+#| output: false
+df_orig <- df
+
+df <- bind_rows(df_orig, df.long) %>%
+       filter(dx == "22q11DS", Source == "CHOP") %>%
+       arrange(!is.na(main_analysis)) %>%
+       mutate(across((contains("CT.") | contains("meanCT")), ~ ifelse(age_years < 2, NA, .x)),
+              across((contains("CT.") | contains("meanCT"))
+                     & contains("normalised"), ~ .x*10000)) %>%
+       distinct(participant, AgeTransformed, sex, .keep_all = T)
+
+# Add in longitudinal data for modeling (longitudinal data will be downweighted such that each subject has a total weight of one)
+df.long$long <- TRUE
+df <- left_join(df,df.long %>% select(participant, AgeTransformed, long)) %>%
+          mutate(long = !is.na(long)) %>%
+          filter(pathology == "Normal")
+
+# Weight each observation by the inverse of the number of scans contributed by
+# its participant, so that the participants with longitudinal 
+# scans do not receive more influence on the fit than single-scan participants.
+df <- df %>%
+        add_count(participant) %>%
+        mutate(weight = 1/n)
+```
+
+## Generate LMSz Growth Charts
+
+```{r}
+#| label: define-candidate-mu-sigma-models
+#| output: false
+# Candidate mu (m_models) and sigma (s_models) model sets, per manuscript
+# Equations S1/S2: full age*sex interaction down to intercept-only/null. The
+# best-fitting mu and sigma model (by BIC) are selected independently below.
+m_models = c('~ AgeTransformed + sex + AgeTransformed*sex',
+             '~ AgeTransformed + sex',
+             '~ AgeTransformed',
+             '~ sex',
+             '~ 1',
+             '~ 0')
+
+s_models = c('~ AgeTransformed + sex',
+             '~ AgeTransformed',
+             '~ sex',
+             '~ 0')
+
+```
+
+```{r}
+#| label: fit-lmsz-models-per-phenotype
+#| output: false
+slip_worm_plots <- list()
+models <- tibble(feature = features,
+                 m_model = "",
+                 s_model = "",
+                 AIC = NA,
+                 BIC = Inf,
+                 age_coef = NA,
+                 sex_coef = NA,
+                 intercept_coef = NA,
+                 interaction_coef = NA,
+                 age_sigma_coef = NA,
+                 sex_sigma_coef = NA,
+                 intercept_sigma_coef = NA,
+                 interaction_sigma_coef = NA)
+library(gamlss)
+# Build the growth chart model
+p <- "zscore" # specify the phenotype
+dir.create("../lmsz/lmsz_models_slip", recursive = T)
+bc_dir = "../../22q_analysis_GM_revisions/braincharts_rac/gamlss"
+for (pheno in features) {
+  print(pheno)
+  pheno_name <- glue("{pheno}Transformed.q.wre")
+  zscore_name <- glue("{pheno}Transformed.q.zscore")
+  old_pheno <- slip_features$old_pheno[slip_features$new_pheno == pheno]
+  # Load SLIP fit model
+  if (grepl("CT",pheno)) {
+      orig_fit <- readRDS(glue("{bc_dir}/RDS/joint_mpr-{old_pheno}Transformed/FIT.EXTRACT.rds"))
+  } else {
+      orig_fit <- readRDS(glue("{bc_dir}/RDS/joint_median-{old_pheno}Transformed/FIT.EXTRACT.rds"))
+  }
+  
+  # Make subset and zero-weight outliers
+  # Zero-weight the following
+    # > 21 years old
+    # Not an A-D deletion
+    # Gene z-score too extreme
+  df_tmp <- df %>%
+              select(participant, AgeTransformed, sex, weight, 
+                     age_years, Deletion_Type,
+                     !!pheno_name, !!zscore_name) %>%
+              rename(pheno = !!pheno_name,
+                     zscore = !!zscore_name) %>%
+              na.omit()  %>%
+              mutate(gene_z = scale(zscore)[,1],
+                     weight = ifelse(age_years <= 21, weight, 0),
+                     weight = ifelse(Deletion_Type == "A-D", weight, 0))
+  
+  # Loop through each mu and sigma model and find smallest BIC
+  for (m in m_models) {
+    for (s in s_models) {
+      print(m)
+      print(s)
+      growthChartModel_all <- gamlss(formula = as.formula(glue("zscore {m}")),
+                                     sigma.formula = as.formula(glue("zscore {s}")),
+                                     family = NO,
+                                     data = df_tmp,
+                                     weights = df_tmp$weight,
+                                     control = gamlss.control(n.cyc = 200),  # See (2)
+                                     trace = F)
+      # Iterative outlier exclusion: zero the weight of any observation whose
+      # residual from the initial fit exceeds |3.5|, then refit below so the
+      # final model/BIC are not driven by extreme outliers.
+      df_tmp$weight_tmp <- df_tmp$weight
+      df_tmp$weight_tmp[which(abs(resid(growthChartModel_all)) > 3.5)] <- 0
+
+      growthChartModel <- gamlss(formula = as.formula(glue("zscore {m}")),
+                                     sigma.formula = as.formula(glue("zscore {s}")),
+                                     family = NO,
+                                     data = df_tmp,
+                                     weights = df_tmp$weight_tmp,
+                                     control = gamlss.control(n.cyc = 200),  # See (2)
+                                     trace = F)
+      if (growthChartModel$sbc <= models$BIC[models$feature == pheno]) {
+        fin_model <- growthChartModel
+        models$m_model[models$feature == pheno] <- m
+        models$s_model[models$feature == pheno] <- s
+        models$BIC[models$feature == pheno] <- growthChartModel$sbc
+      }
+      print("--------------")
+    }
+  }
+
+          
+  print(pheno)
+  
+  # Collect model features
+  models$m_model[models$feature == pheno] <- format(fin_model$mu.formula)
+  models$s_model[models$feature == pheno] <- format(fin_model$sigma.formula)
+  
+  models[models$feature == pheno,"intercept_coef"]   <- fin_model$mu.coefficients["(Intercept)"]
+  models[models$feature == pheno,"age_coef"]         <- fin_model$mu.coefficients["AgeTransformed"]
+  models[models$feature == pheno,"sex_coef"]         <- fin_model$mu.coefficients["sexMale"]
+  models[models$feature == pheno,"interaction_coef"] <- fin_model$mu.coefficients["AgeTransformed:sexMale"]
+  
+  models[models$feature == pheno,"intercept_sigma_coef"]   <- fin_model$sigma.coefficients["(Intercept)"]
+  models[models$feature == pheno,"age_sigma_coef"]         <- fin_model$sigma.coefficients["AgeTransformed"]
+  models[models$feature == pheno,"sex_sigma_coef"]         <- fin_model$sigma.coefficients["sexMale"]
+  models[models$feature == pheno,"interaction_sigma_coef"] <- fin_model$sigma.coefficients["AgeTransformed:sexMale"]
+
+  models$AIC[models$feature == pheno] <- fin_model$aic
+  models$BIC[models$feature == pheno] <- fin_model$sbc
+  
+  saveRDS(fin_model,glue("../lmsz/lmsz_models_slip/SLIP_lmsz_{old_pheno}Transformed.rds"))
+
+  # Update LMSz quantiles
+  df_tmp <- df_tmp %>%
+        add_column(!!glue("{pheno}Transformed.q.lmsz") := pred_og_centile_mod(fin_model,
+                                                                          df_tmp)) %>%
+        select(-c(pheno, zscore, gene_z, age_years, Deletion_Type, weight))
+ 
+  df <- df %>% left_join(df_tmp, by = join_by(participant, sex, AgeTransformed))
+  
+  # Save worm plot
+  slip_worm_plots[[pheno]] <- wp.taki(fin_model) +
+                                  ggtitle("LMSz Worm Plot") +
+                                  theme_pubr() +
+                                  theme(plot.title = element_text(size = 12),
+                                        axis.title = element_text(size = 12))
+
+  
+  print("-------------------------")
+}
+```
+
+```{r}
+#| label: save-chop-lmsz-data
+#| output: false
+write_csv(df,"../data/CHOP/CHOP_data_lmsz.csv")
+```
+
+## Generate Growth-Chart Curves
+
+```{r}
+#| label: generate-fans-all-phenotypes
+#| output: false
+for (pheno in features) {
+  print(pheno)
+  fans <-  backtransform_centile_fans(pheno, sim_list)
+  if (pheno == features[1]) {
+    out_fans_slip <- fans
+  } else {
+    out_fans_slip <- bind_rows(out_fans_slip, fans)
+  }
+}
+df_slip <- df %>% filter(Deletion_Type == "A-D")
+```
+
+```{r}
+#| label: exclude-outlier-superiorparietal-ct
+#| output: false
+# CT.rh_superiorparietal is an outlier exclude it
+models[models$feature == "CT.rh_superiorparietal",c("AIC","BIC",colnames(models)[grepl("_coef",colnames(models))])] <- NA
+```
+
+# Generate Plots
+
+## Rescale Curves to Native Units
+
+```{r}
+#| label: rescale-ct-and-etiv-fans
+#| output: false
+# CT scale is off and eTIV fans are doubled due to the structure of the SLIP models and input data. Manually correct
+out_fans_slip <- out_fans_slip %>% 
+                          mutate(SLIP_input_fans = ifelse(grepl("CT",pheno),
+                                                          SLIP_input_fans*10000,
+                                                          SLIP_input_fans),
+                                 LMSz_fans = ifelse(grepl("CT",pheno),
+                                                          LMSz_fans*10000,
+                                                          LMSz_fans)) %>% 
+                          mutate(SLIP_input_fans = ifelse(pheno == "eTIV",
+                                                          SLIP_input_fans/2,
+                                                          SLIP_input_fans),
+                                 LMSz_fans = ifelse(pheno == "eTIV",
+                                                          LMSz_fans/2,
+                                                          LMSz_fans))
+```
+
+## Plot SLIP and LMSz Global Trajectories
+
+```{r}
+#| label: define-age-axis-breaks
+#| output: false
+x_breaks <- log(c(280, 365.25*2+280, 
+                  365.25*6+280, 365.25*18+280))
+x_labs <- c("0y","2y","6y","18y")
+```
+
+```{r, fig.height = 7.5, fig.width = 11}
+#| label: build-slip-and-lmsz-trajectory-plots
+#| output: false
+slip_plots <- list()
+lmsz_plots <- list()
+mult <- 1
+out_fans_plot <- out_fans_slip
+for (pheno_of_int in c("eTIV","Ventricles","GMV","Cerebellum.all",
+                       "sGMV","totalSA","WMV","meanCT")) {
+  df_plot <- df_slip
+  df_plot$pheno <- df_plot[[glue("{pheno_of_int}Transformed.normalised")]]
+  df_plot$pheno[is.na(df_plot[[glue("{pheno_of_int}Transformed.q.lmsz")]])] <- NA
+  if (grepl("SA",pheno_of_int)) {
+    ylab_text <- bquote('Surface Area')
+  } else if (grepl("CT",pheno_of_int)) {
+    ylab_text <- bquote('Thickness')
+    df_plot <- df_plot %>% filter(age_days >= 2*365.25+280) ### BRING FURTHER UP????
+  } else {
+    ylab_text <- bquote('Volume')
+  }
+  if(pheno_of_int == "totalSA") {
+    pheno_label <- "Cortical Surface Area"
+  } else if (pheno_of_int == "meanCT") {
+    pheno_label <- "Mean Cortical Thickness"
+  } else if (pheno_of_int == "eTIV") {
+    pheno_label <- "Intracranial Volume"
+  } else if (pheno_of_int == "Cerebellum.all") {
+    pheno_label <- "Cerebellum"
+  } else if (pheno_of_int == "GMV") {
+    pheno_label <- "Gray Matter Volume"
+  } else if (pheno_of_int == "sGMV") {
+    pheno_label <- "Subcortical Gray Matter Volume"
+  } else if (pheno_of_int == "WMV") {
+    pheno_label <- "White Matter Volume"
+  } else {
+    pheno_label <- pheno_of_int
+  }
+  out_fans_plot <- out_fans_slip %>% 
+                    filter(pheno == pheno_of_int,
+                           !(centile_cat %in% c("cent_0.25", "cent_0.75"))) %>%
+                    mutate(SLIP_input_fans = SLIP_input_fans*mult,
+                           LMSz_fans = LMSz_fans*mult)
+  # CT data is questionable at 0y. Limit to 2 years
+  if (grepl("CT",pheno_of_int)) {
+    df_plot <- df_plot %>% filter(age_days >= 2*365.25+280)
+    out_fans_plot <- out_fans_plot %>% filter(AgeTransformed >= log(2*365.25+280))
+  }
+  print(pheno_of_int)
+  
+  # Plot the original SLIP fans with 22q data points
+  slip_plots[[pheno_of_int]] <- ggplot(out_fans_plot) +
+                                    geom_point(data = df_plot, aes(y = pheno,
+                                               x = AgeTransformed, fill=sex), 
+                                               alpha=0.5, shape=21, size = 0.5) +
+                                    geom_line(aes(x = AgeTransformed, y = SLIP_input_fans,
+                                                  group = interaction(centile_cat, sex),
+                                                  color = sex,
+                                                  linewidth = line_size,
+                                                  linetype = line_type)) +
+                                    scale_linewidth_identity() +
+                                    scale_linetype_identity() +
+                                    scale_colour_manual(values = c("firebrick","royalblue")) +
+                                    scale_x_continuous(breaks = x_breaks, labels = x_labs) +
+                                    ggtitle(pheno_label) + theme_pubclean() +
+                                    xlab("") + ylab(ylab_text) +
+                                  theme(plot.title = element_text(size = 12),
+                                        axis.title = element_text(size = 10),
+                                        axis.text = element_text(size = 8)) +
+                                  figure_theme
+  
+  # Plot the 22q-adjusted SLIP fans with 22q data points
+  lmsz_plots[[pheno_of_int]] <- ggplot(out_fans_plot) +
+                                    geom_point(data = df_plot, aes(y = pheno,
+                                               x = AgeTransformed, fill=sex), 
+                                               alpha=0.5, shape=21, size = 0.5) +
+                                    geom_line(aes(x = AgeTransformed, y = LMSz_fans,
+                                                  group = interaction(centile_cat, sex),
+                                                  color = sex,
+                                                  linewidth = line_size,
+                                                  linetype = line_type)) +
+                                    scale_linewidth_identity() +
+                                    scale_linetype_identity() +
+                                    scale_colour_manual(values = c("firebrick","royalblue")) +
+                                    scale_x_continuous(breaks = x_breaks, labels = x_labs) +
+                                    theme_pubclean() +
+                                    xlab("") + ylab(ylab_text) +
+                                  theme(plot.title = element_text(size = 12),
+                                        axis.title = element_text(size = 10),
+                                        axis.text = element_text(size = 8)) +
+                                  figure_theme
+  
+  # Equalize Axes
+  p_y_min <- min(layer_scales(slip_plots[[pheno_of_int]])$y$range$range[1],
+                 layer_scales(lmsz_plots[[pheno_of_int]])$y$range$range[1])
+  p_y_max <- max(layer_scales(slip_plots[[pheno_of_int]])$y$range$range[2],
+                 layer_scales(lmsz_plots[[pheno_of_int]])$y$range$range[2])
+
+  slip_plots[[pheno_of_int]] <- slip_plots[[pheno_of_int]] + ylim(p_y_min,p_y_max)
+  lmsz_plots[[pheno_of_int]] <- lmsz_plots[[pheno_of_int]] + ylim(p_y_min,p_y_max)
+}
+```
+
+## Plot Overlaid Trajectories
+
+```{r}
+#| label: build-overlap-trajectory-plots
+#| output: false
+
+# Generate a plot that averages centile fans across sexes for easy comparison between 22q and SLIP
+overlap_plots_deriv <- list()
+out_fans_plot <- out_fans_slip
+for (pheno_of_int in c("eTIV","Ventricles","GMV","Cerebellum.all",
+                       "sGMV","totalSA","WMV","meanCT")) {
+  df_plot <- df_slip
+  df_plot$pheno <- df_plot[[glue("{pheno_of_int}Transformed.normalised")]]
+  if (grepl("SA",pheno_of_int)) {
+    ylab_text <- bquote('Surface Area')
+    mult <- 1
+  } else if (grepl("CT",pheno_of_int)) {
+    ylab_text <- bquote('Thickness')
+    mult <- 1
+  } else {
+    ylab_text <- bquote('Volume')
+    mult <- 1
+  }
+  if (pheno_of_int == "eTIV") {
+    pheno_renamed <- "Intracranial Volume"
+  } else if (pheno_of_int == "Cerebellum.all") {
+    pheno_renamed <- "Cerebellum"
+  } else {
+    pheno_renamed <- pheno_of_int
+  }
+  
+  out_fans_plot <- out_fans_slip %>% 
+                    filter(pheno == pheno_of_int,
+                           !(centile_cat %in% c("cent_0.25", "cent_0.75"))) %>%
+                    mutate(SLIP_input_fans = SLIP_input_fans*mult,
+                           LMSz_fans = LMSz_fans*mult)
+  if (grepl("CT",pheno_of_int)) {
+    df_plot <- df_plot %>% filter(age_days >= 2*365.25+280)
+    out_fans_plot <- out_fans_plot %>% filter(AgeTransformed >= log(2*365.25+280))
+  }
+  print(pheno_of_int)
+  out_fans_plot_avg <-   out_fans_plot %>% 
+                          filter(grepl(str_replace_all(pheno_of_int,"SA.","SA.*"),pheno),
+                                 !(centile_cat %in% c("cent_0.25", "cent_0.75"))) %>%
+                          mutate(SLIP_input_fans = SLIP_input_fans*mult,
+                                 LMSz_fans = LMSz_fans*mult) %>%
+                          group_by(model, AgeTransformed, 
+                                   centile_cat, line_size, line_type) %>%
+                          summarize(across(contains("fans"), ~mean(.x, na.rm = T))) %>%
+                          ungroup() %>%
+                          select(-c(line_size,line_type, LMSz_input_fans)) %>%
+                          pivot_wider(names_from = "centile_cat", 
+                                      values_from = c("LMSz_fans","SLIP_input_fans"))
+  
+  out_fans_plot <-   out_fans_plot %>% 
+                          filter(grepl(str_replace_all(pheno_of_int,"SA.","SA.*"),pheno),
+                                 !(centile_cat %in% c("cent_0.25", "cent_0.75"))) %>%
+                          mutate(SLIP_input_fans = SLIP_input_fans*mult,
+                                 LMSz_fans = LMSz_fans*mult) %>%
+                          select(-c(line_size,line_type, LMSz_input_fans,
+                                    LMSz_input_centile, pheno, site, fit_file)) %>%
+                          pivot_wider(names_from = "centile_cat", 
+                                      values_from = c("LMSz_fans","SLIP_input_fans"))
+  
+  overlap_plots_deriv[[pheno_of_int]] <- ggplot(out_fans_plot_avg, aes(x = AgeTransformed)) +
+                  # 22q-Adjusted: ribbon (accent color)
+                  geom_ribbon(aes(ymin = LMSz_fans_cent_0.025,
+                                  ymax = LMSz_fans_cent_0.975,
+                                  fill = "22q11DS (LMSz)"),
+                              alpha = 0.25) +
+                  # Reference: dashed CI bounds, no fill (black)
+                  geom_line(aes(y = SLIP_input_fans_cent_0.025, color = "Reference (SLIP)"),
+                            linetype = "dashed", linewidth = 0.4) +
+                  geom_line(aes(y = SLIP_input_fans_cent_0.975, color = "Reference (SLIP)"),
+                            linetype = "dashed", linewidth = 0.4) +
+                  # central trend lines
+                  geom_line(aes(y = SLIP_input_fans_cent_0.5, color = "Reference (SLIP)"),
+                            linewidth = 1) +
+                  geom_line(aes(y = LMSz_fans_cent_0.5, color = "22q11DS (LMSz)"), 
+                            linewidth = 1) +
+                  scale_x_continuous(breaks = x_breaks, labels = x_labs, 
+                                     expand = expansion(mult = 0.01)) +
+                  ggtitle(pheno_renamed) + theme_pubclean() +
+                  xlab("") + ylab(ylab_text) + 
+                  labs(colour = "Growth Chart", fill = "Growth Chart") +
+                  scale_colour_manual(values = c("22q11DS (LMSz)" = "#D55E00", 
+                                                 "Reference (SLIP)" = "black")) +
+                  scale_fill_manual(values = c("22q11DS (LMSz)" = "#D55E00")) +
+                  scale_linewidth_identity() +
+                  theme(plot.title = element_text(size = 12),
+                        axis.title = element_text(size = 10),
+                        axis.text = element_text(size = 8)) +
+                  guides(fill = "none") +
+                          figure_theme
+}
+```
+
+## Regional LMSz Coefficient Maps (Figure S10)
+
+#### Mu
+
+```{r, fig.height = 4.5, fig.width = 7.5}
+#| label: plot-mu-regional-effects
+#| fig-cap: "Regional age and sex coefficients from the mu (mean) component of the syndrome-specific LMSz models."
+
+models$label <- models$feature
+
+lim <- models %>% select(age_coef, sex_coef) %>% abs() %>% max(na.rm = T)
+lim <- ceiling(lim*10)/10
+plot_lims <- c(-lim,lim)
+
+p_age_effects <- plot_extreme_deviation_maps(models, 
+                           fill_col = "age_coef", 
+                           color_scheme = c("royalblue","white","firebrick"),
+                           plot_lims = plot_lims, fill_name = "",
+                           colorbar_title = "Beta",
+                           sig_col = NA, cats = c("GM", "SA","CT", "SUBC"),
+                           cort_only = F, add_colorbar = F, add_fillbar = T,
+                           exclude_y_label = F, formatted = T, percent = F)
+
+p_sex_effects <- plot_extreme_deviation_maps(models, 
+                           fill_col = "sex_coef", 
+                           color_scheme = c("royalblue","white","firebrick"),
+                           plot_lims = plot_lims, fill_name = "",
+                           colorbar_title = "Beta",
+                           sig_col = NA, cats = c("GM", "SA","CT", "SUBC"),
+                           cort_only = F, add_colorbar = F, add_fillbar = T,
+                           exclude_y_label = F, formatted = T, percent = F)
+
+p_age_title <- ggdraw() + draw_label("Age", angle = 90,
+                                  x = 0.5, hjust = 0.5, fontface = "bold")
+p_sex_title <- ggdraw() + draw_label("Sex", angle = 90,
+                                  x = 0.5, hjust = 0.5, fontface = "bold")
+
+p_age_effects <- ggarrange(p_age_title, p_age_effects,
+                            nrow = 1, ncol = 2, widths = c(0.1,1.2),
+                            legend = "bottom", common.legend = T)
+
+p_sex_effects <- ggarrange(p_sex_title, p_sex_effects,
+                            nrow = 1, ncol = 2, widths = c(0.1,1.2),
+                            legend = "bottom", common.legend = T)
+
+p_effects_mu <- ggarrange(p_age_effects, p_sex_effects, nrow = 2, ncol = 1,
+                            heights = c(1,1), common.legend = T, legend = "bottom")
+p_effects_mu
+```
+
+#### Sigma
+
+```{r, fig.height = 4.5, fig.width = 8.5}
+#| label: plot-sigma-regional-effects
+#| fig-cap: "Regional age and sex coefficients from the sigma (variance) component of the syndrome-specific LMSz models."
+models$label <- models$feature
+
+lim <- models %>% select(age_sigma_coef, sex_sigma_coef) %>% abs() %>% max(na.rm = T)
+lim <- ceiling(lim*10)/10
+
+plot_lims <- c(-lim,lim)
+
+p_age_effects <- plot_extreme_deviation_maps(models, 
+                           fill_col = "age_sigma_coef", 
+                           color_scheme = c("royalblue","white","firebrick"),
+                           plot_lims = plot_lims, fill_name = "",
+                           colorbar_title = "Beta",
+                           sig_col = NA, cats = c("GM", "SA","CT", "SUBC"),
+                           cort_only = F, add_colorbar = F, add_fillbar = T,
+                           exclude_y_label = F, formatted = T, percent = F)
+
+p_sex_effects <- plot_extreme_deviation_maps(models, 
+                           fill_col = "sex_sigma_coef", 
+                           color_scheme = c("royalblue","white","firebrick"),
+                           plot_lims = plot_lims, fill_name = "",
+                           colorbar_title = "Beta",
+                           sig_col = NA, cats = c("GM", "SA","CT", "SUBC"),
+                           cort_only = F, add_colorbar = F, add_fillbar = T,
+                           exclude_y_label = F, formatted = T, percent = F)
+
+p_age_title <- ggdraw() + draw_label("Age", angle = 90,
+                                  x = 0.5, hjust = 0.5, fontface = "bold")
+p_sex_title <- ggdraw() + draw_label("Sex", angle = 90,
+                                  x = 0.5, hjust = 0.5, fontface = "bold")
+
+p_age_effects <- ggarrange(p_age_title, p_age_effects,
+                            nrow = 1, ncol = 2, widths = c(0.1,1.2),
+                            legend = "bottom", common.legend = T)
+
+p_sex_effects <- ggarrange(p_sex_title, p_sex_effects,
+                            nrow = 1, ncol = 2, widths = c(0.1,1.2),
+                            legend = "bottom", common.legend = T)
+
+p_effects_sigma <- ggarrange(p_age_effects, p_sex_effects, nrow = 2, ncol = 1,
+                            heights = c(1,1), common.legend = T, legend = "bottom")
+
+p_effects_sigma
+```
+
+```{r, fig.height = 8.5, fig.width = 8.5}
+#| label: save-figure-s10-regional-coefficients
+#| fig-cap: "Figure S10. Regional age and sex coefficients of the syndrome-specific LMSz models, shown separately for the mu and sigma components."
+t1 <- ggdraw() + 
+              draw_label(glue('Mu Effects'))
+t2 <- ggdraw() + 
+              draw_label(glue('Sigma Effects'))
+ggarrange(t1, p_effects_mu, t2, p_effects_sigma, nrow = 4, heights = c(0.3,4.2,0.3,4.2))
+ggsave("../figures_final/png/figure_s10_regional_lmsz_coefficients.png", bg = "white")
+ggsave("../figures_final/pdf/figure_s10_regional_lmsz_coefficients.pdf", bg = "white")
+```
+
+## Assemble Figure 4
+
+```{r, fig.height= 12, fig.width=8}
+#| label: assemble-figure-4-panels
+#| output: false
+library(patchwork)
+# 4 x 6 plot
+  # 4 rows (IDPs)
+  # 3 cols (orig, adjusted, overlaid)
+  # repeat
+# bottom row: exploratory{r, fig.height = 12, fig.width = 12}
+
+leg1 <- get_legend(slip_plots$eTIV + labs(fill = "Sex", color = "Sex") + 
+                      theme(legend.title = element_text(size = base_font - 1, 
+                                                        margin = margin(r = 15)),
+                            legend.spacing.x = unit(0.3, "cm"))) %>% 
+                as_ggplot() + figure_theme
+leg2 <- get_legend(overlap_plots_deriv$eTIV + 
+                      theme(legend.title = element_text(size = base_font - 1, 
+                                                        margin = margin(r = 15)),
+                            legend.spacing.x = unit(0.3, "cm"))) %>% 
+                as_ggplot() + figure_theme
+
+plots_final <- list()
+for (pheno_of_int in c("eTIV","GMV","sGMV","WMV",
+                       "Ventricles","Cerebellum.all",
+                       "totalSA","meanCT")) {
+  if (pheno_of_int == "eTIV") {
+    pheno_label <- "Intracranial Volume"
+  } else if (pheno_of_int == "Cerebellum.all") {
+    pheno_label <- "Cerebellum"
+  } else if (pheno_of_int == "totalSA") {
+    pheno_label <- "Cortical Surface Area"
+  } else if (pheno_of_int == "meanCT") {
+    pheno_label <- "Mean Cortical Thickness"
+  } else if (pheno_of_int == "GMV") {
+    pheno_label <- "Gray Matter Volume"
+  } else if (pheno_of_int == "sGMV") {
+    pheno_label <- "Subcortical Gray Matter Volume"
+  } else if (pheno_of_int == "WMV") {
+    pheno_label <- "White Matter Volume"
+  } else {
+    pheno_label <- pheno_of_int
+  }
+
+  plot_marg <- margin(t = 2, r = 3, b = 0, l = 2)
+
+  p_ref <- slip_plots[[pheno_of_int]] + ggtitle("Reference") + 
+              theme(legend.position = "none",
+                  plot.title = element_text(margin = margin(t = 0, b = 2), vjust = 0),
+                  plot.margin = plot_marg) +
+               figure_theme
+  
+  y_scale <- layer_scales(p_ref)$y$range$range
+  y_breaks <- ggplot_build(p_ref)$layout$panel_params[[1]]$y$breaks
+  
+  p_ref <- p_ref  +
+               scale_y_continuous(breaks = y_breaks, limits = y_scale) +
+               figure_theme + theme(axis.text.x = element_text(size = base_font - 2.5))
+  
+  p_adj <- lmsz_plots[[pheno_of_int]] + ggtitle("22q11DS") + 
+                theme(legend.position = "none",
+                      plot.title = element_text(margin = margin(t = 0, b = 2), vjust = 0),
+                      plot.margin = plot_marg) +
+               scale_y_continuous(breaks = y_breaks, limits = y_scale) +
+               figure_theme + theme(axis.text.x = element_text(size = base_font - 2.5))
+  
+  p_ovr <- overlap_plots_deriv[[pheno_of_int]] + ggtitle("Overlap") +
+                theme(legend.position = "none",
+                      plot.title = element_text(margin = margin(t = 0, b = 2), vjust = 0),
+                      plot.margin = plot_marg) + 
+              scale_y_continuous(breaks = y_breaks, limits = y_scale) +
+              figure_theme + theme(axis.text.x = element_text(size = base_font - 2.5))
+  
+  p1 <- (p_ref | p_adj | p_ovr) + plot_layout(axes = "collect")
+
+  p_title <- ggdraw() + draw_label(pheno_label, fontface = "bold",
+                                   size = base_font + 1) + figure_theme
+  plots_final[[pheno_of_int]] <- plot_grid(p_title, p1, nrow = 2, ncol = 1,
+                                            rel_heights = c(0.07, 1))
+}
+
+p1A <- plot_grid(plotlist = plots_final[1:4], nrow = 4, ncol = 1)
+p1B <- plot_grid(plotlist = plots_final[5:8], nrow = 4, ncol = 1)
+p1  <- plot_grid(p1A, NULL, p1B, rel_widths = c(1, 0.01, 1), ncol = 3)
+p2 <- plot_grid(NULL, leg1, leg2, NULL, nrow = 1, ncol = 4,
+                 rel_widths = c(0.2, 1, 1, 0.2))
+```
+
+```{r, fig.height= 8.85, fig.width=6.69}
+#| label: save-figure-4-growth-charts
+#| output: false
+library(grid)
+p <- ggarrange(p1,p2, heights = c(1,0.06), nrow = 2, ncol = 1)
+ggsave("../figures_final/png/figure_4_growth_charts.png", bg = "white")
+ggsave("../figures_final/pdf/figure_4_growth_charts.pdf", bg = "white")
+```
+
+```{r, fig.height= 8.85, fig.width=6.69}
+#| label: display-figure-4
+#| echo: false
+#| fig-cap: "Figure 4. Syndrome-specific growth charts for eight global brain measures, showing the Reference (SLIP) chart, the 22q11DS (LMSz) chart, and the two overlaid."
+p
+```
+
+## Save LMSz Model Table (Table S11)
+
+```{r}
+#| label: save-formatted-lmsz-table
+models_fmt <- models %>% select(-c(m_model, s_model)) %>%
+                  mutate(label = case_match(feature,
+                                            "Cerebellum.all" ~ "Cerebellum",
+                                            "SUBC.Left_Accumbens.area" ~ "SUBC.Left_Accumbens",
+                                            "SUBC.Right_Accumbens.area" ~ "SUBC.Right_Accumbens",
+                                            .default = feature)) %>%
+                  relocate(label, .before = feature) %>%
+                  separate_wider_delim(label, delim = ".", names = c("IDP Group", "IDP"),
+                                       too_few = "align_end") %>%
+                  mutate(`IDP Group` = ifelse(is.na(`IDP Group`), "Global", `IDP Group`),
+                         `IDP Group` = factor(`IDP Group`, levels = c("Global","SUBC","GM","SA","CT")),
+                         across(contains("_coef"), ~ round(.x, 2)),
+                         across(ends_with("IC"), ~ round(.x, 0))) %>%
+                  select(-feature, contains("interaction")) %>%
+                  arrange(`IDP Group`, IDP)
+models_fmt
+write_csv(models_fmt, "../tables/formatted/table_s11.csv")
+
+```
+
+## Plot Global Worm Plots (Figure S16)
+
+```{r, fig.height = 6, fig.width = 12}
+#| label: save-figure-s15-worm-plots
+#| fig-cap: "Figure S16. Worm plots for the global brain measures from the syndrome-specific LMSz models."
+
+glob_wps <- slip_worm_plots[global_measures]
+for (i in 1:length(global_measures)) {
+  glob_wps[[global_measures[i]]] <- glob_wps[[global_measures[i]]] + ggtitle(global_measure_names[i])
+}
+
+ggarrange(plotlist = glob_wps, nrow = 2, ncol = 4)
+ggsave("../figures_final/png/figure_s16_worm_plots.png", bg = "white")
+ggsave("../figures_final/pdf/figure_s16_worm_plots.pdf", bg = "white")
+```
+
+## Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

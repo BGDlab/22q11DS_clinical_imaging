@@ -1,0 +1,474 @@
+---
+title: "CHOP Normative Centile Processing"
+author: "Benjamin Jung, PhD"
+format:
+  pdf:
+    documentclass: scrreprt
+    toc: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r}
+#| label: setup-environment
+#| output: false
+library(tidyverse)
+library(glue)
+library(freesurfer)
+set.seed(2514)
+```
+
+## Load and Standardize SLIP Centiles
+
+Centiles for SLIP and the 22q sample were already pre-calculated, so we will load an format them here.
+
+### Load Volume and Centile Data
+
+```{r}
+#| label: load-slip-centile-data
+#| output: false
+# modality controls which SLIP centile file is loaded: "all" = median-of-session
+# (primary analysis), "mpr" = MPRAGE-only sensitivity cohort. 
+# Both must be run for the full analysis
+modality <- "mpr" #"mpr"
+if (modality == "mpr") {
+  # Load MPRAGE centiles
+  suf <- "_mpr"
+  file <- "../data/CHOP/braincharts/slip_mpr_centiles.csv"
+  df <- read_csv(file, show_col_types = F) %>% mutate(dx = ifelse(dx == "22q","22q11DS","CN"))
+} else {
+  # Load median-of-session centiles
+  suf <- "_all"
+  file <- "../data/CHOP/braincharts/slip_median_centiles.csv"
+  df <- read_csv(file, show_col_types = F) %>% mutate(dx = ifelse(dx == "22q","22q11DS","CN"))
+}
+```
+
+### Rename Phenotypes
+
+```{r}
+#| label: rename-phenotypes
+#| output: false
+# Recode phenotypes: standardize SLIP/FreeSurfer feature names to the naming
+# convention used by the ENIGMA feature set for downstream matching
+pheno_dict <- tibble(phenotype = unique(df$phenotype), new_pheno = unique(df$phenotype)) %>%
+    filter(!grepl("BrainSegVol",phenotype) &
+           !grepl("SupraTentorial",phenotype) &
+           !grepl("Mask",phenotype) &
+           !grepl("WhiteSurfArea",phenotype) &
+           !grepl("h_eTIV",phenotype) &
+           !grepl("csf",phenotype) &
+           !grepl("NumVert",phenotype)) %>%
+    mutate(new_pheno = str_remove_all(new_pheno, "FS."),
+          new_pheno = str_replace_all(new_pheno, "SS.GLOB.","GLOB."),
+          new_pheno = str_replace_all(new_pheno, "SS.SUBC.","SUBC."),
+          new_pheno = str_replace_all(new_pheno, "SS.SA.","SA."),
+          new_pheno = str_replace_all(new_pheno, "SS.CT.","CT."),
+          new_pheno = str_replace_all(new_pheno, "rh\\.","rh_"),
+          new_pheno = str_replace_all(new_pheno, "lh\\.","lh_"),
+          new_pheno = str_replace_all(new_pheno, "right","Right"),
+          new_pheno = str_replace_all(new_pheno, "left","Left"),
+          new_pheno = str_replace_all(new_pheno, "Right\\.","Right_"),
+          new_pheno = str_replace_all(new_pheno, "Left\\.","Left_"),
+          new_pheno = str_replace_all(new_pheno, "Ventral.DC","VentralDC"),
+          new_pheno = str_replace_all(new_pheno, "SubcGM","SUBC"),
+          new_pheno = str_replace_all(new_pheno, "thalamus","Thalamus_Proper"),
+          new_pheno = str_replace_all(new_pheno, "putamen","Putamen"),
+          new_pheno = str_replace_all(new_pheno, "pallidum","Pallidum"),
+          new_pheno = str_replace_all(new_pheno, "accumbens","Accumbens"),
+          new_pheno = str_replace_all(new_pheno, "amygdala","Amygdala"),
+          new_pheno = str_replace_all(new_pheno, "caudate","Caudate"),
+          new_pheno = str_replace_all(new_pheno, "ventral.DC","VentralDC"),
+          new_pheno = str_replace_all(new_pheno, "hippocampus","Hippocampus"),
+          new_pheno = str_replace_all(new_pheno, "SUBC.X","SUBC.x"),
+          new_pheno = str_replace_all(new_pheno, "\\.ventricle","_Ventricle"),
+          new_pheno = str_replace_all(new_pheno, "lateral_","Lateral_"),
+          new_pheno = str_replace_all(new_pheno, "brain.stem","Brain.Stem"),
+          new_pheno = str_replace_all(new_pheno, "inferior.Lateral_Ventricle","Inf_Lat_Vent"),
+          new_pheno = str_replace_all(new_pheno, "cerebellum.cortex","Cerebellum_Cortex"),
+          new_pheno = str_replace_all(new_pheno, "GLOB.CerebellumVolume","Cerebellum.all"),
+          new_pheno = str_replace_all(new_pheno, "GLOB.eTIV","eTIV"),
+          new_pheno = str_replace_all(new_pheno, "GLOB.Cortex","GMV"),
+          new_pheno = str_replace_all(new_pheno, "GLOB.CerebralWhiteMatterVol","WMV"),
+          new_pheno = str_replace_all(new_pheno, "GLOB.SubCortGrayVol","sGMV"),
+          new_pheno = str_replace_all(new_pheno, "GLOB.Ventricles","Ventricles"),
+          new_pheno = str_replace_all(new_pheno, "GLOB.CorticalSurfaceArea","totalSA"),
+          new_pheno = str_replace_all(new_pheno, "GLOB.MeanCorticalThickness","meanCT"))
+
+df <- df %>%
+          inner_join(pheno_dict) %>%
+          mutate(phenotype = new_pheno) %>%
+          select(-c(new_pheno))
+
+pheno_dict <- pheno_dict %>%
+                  mutate(old_pheno = phenotype) %>%
+                  select(-c(phenotype))
+
+write_csv(pheno_dict, "../data/CHOP/pheno_dict.csv")
+```
+
+```{r}
+#| label: extract-slip-feature-columns
+#| output: false
+slip_feature_cols <- unique(df$phenotype[!startsWith(df$phenotype,"SS.")])
+```
+
+```{r}
+#| label: load-enigma-data-for-comparison
+#| output: false
+fs_df <- read_csv("../data/ENIGMA/ENIGMA_data.csv", show_col_types = F)
+```
+
+```{r}
+#| label: compare-slip-and-enigma-features
+fs_feature_cols <- colnames(fs_df)[grepl(".q.wre",colnames(fs_df)) &
+                                     !grepl("5th_Ventricle",colnames(fs_df))] %>%
+                      str_remove_all("Transformed.q.wre")
+
+print(length(slip_feature_cols[slip_feature_cols %in% fs_feature_cols]))
+print(length(slip_feature_cols))
+```
+
+```{r}
+#| label: identify-missing-slip-features
+missing_cols <- slip_feature_cols[!(slip_feature_cols %in% fs_feature_cols) & grepl("",slip_feature_cols)]
+missing_cols
+```
+
+```{r}
+#| label: identify-enigma-only-features
+fs_feature_cols[!(fs_feature_cols %in% slip_feature_cols)]
+```
+
+```{r}
+#| label: filter-missing-phenotypes
+#| output: false
+df <- df %>% filter(!(phenotype %in% missing_cols))
+```
+
+### Load QC Data
+
+```{r}
+#| label: load-qc-data
+#| output: false
+ss_qc_cols <- c("general white matter","general grey matter",
+                "general csf", "cerebellum", "brainstem",
+                "thalamus","putamen+pallidum","hippocampus+amygdala")
+
+# Add QC measures
+qc_file <- "../data/CHOP/euler/SLIP_QC.csv"
+qc_SLIP_df <- read_csv(qc_file, show_col_types = F) %>% mutate(dx = "CN")
+
+qc_file <- "../data/CHOP/euler/22q_QC.csv"
+qc_22q_df <- read_csv(qc_file, show_col_types = F) %>% mutate(dx = "22q11DS")
+
+qc_cols <- c("euler_lh", "euler_rh", "general white matter", "general grey matter", "general csf", "cerebellum", "brainstem", "thalamus", "putamen+pallidum", "hippocampus+amygdala")
+
+qc_df <- bind_rows(qc_SLIP_df, qc_22q_df)
+
+if (modality == "mpr") {
+  qc_df <- qc_df %>% filter(grepl("acq-MPR",scan_id))
+}
+```
+
+```{r}
+#| label: filter-and-summarize-qc-scores
+#| output: false
+qc_df <- qc_df %>%
+              rowwise() %>%
+              mutate(participant = str_extract(scan_id, "^sub-[A-Za-z0-9]+"),
+                     session_id  = str_extract(scan_id, "ses-.*ageDays"),
+                     meanQC = mean(c_across(any_of(ss_qc_cols)))) %>%
+              select(-c(file_dir, release)) %>%
+              filter(euler_mean > -60,
+                     `general white matter` >= 0.65,
+                     `general grey matter` >= 0.65,
+                     `general csf` >= 0.65,
+                     cerebellum >= 0.65,
+                     brainstem >= 0.65,
+                     thalamus >= 0.65,
+                     `putamen+pallidum` >= 0.65,
+                     `hippocampus+amygdala` >= 0.65) %>%
+            group_by(participant, session_id) %>%
+            summarize(across(any_of(qc_cols), median))
+```
+
+```{r}
+#| label: merge-qc-with-centile-data
+df <- df %>% inner_join(qc_df) %>%
+        rowwise() %>%
+        mutate(euler = mean(euler_lh, euler_rh),
+               ss_qc = mean(`general white matter`, `general grey matter`,
+                            `general csf`,cerebellum,brainstem,thalamus,
+                            `putamen+pallidum`,`hippocampus+amygdala`))
+```
+
+```{r}
+#| label: select-best-session-per-subject
+#| output: false
+# A few individuals have scans on the same day belonging to different sessions, select the score with the highest SS QC
+df <- df %>%
+        group_by(participant, age_days, phenotype) %>%
+        slice_max(ss_qc, with_ties = FALSE) %>%
+        ungroup()
+```
+
+```{r}
+#| label: load-clinical-indication-data
+#| output: false
+# Create new clinical indication column for each row, then limit to participant and clinical indication
+clin_ind_file <- "../data/CHOP/22q_clinical_mris/output_with_extra_data_20201029.csv"
+extra_clinical_data <- read_csv(clin_ind_file, show_col_types = FALSE) %>%
+          mutate(participant = glue("sub-{pat_id}")) %>%
+          mutate(participant = str_replace_all(participant,"22q_","22q")) %>%
+          mutate(age_days = `OBJECT_INFO : age_at_imaging_(days)` + 280) %>%
+          mutate(sex = case_match(SEX_x,
+                                  "F" ~ "Female",
+                                  "M" ~ "Male")) %>%
+          dplyr::select(participant, VCFS_id, sex, age_days,
+                 year_of_scan = `Year of Study`,
+                 Clin_ind = `Clinical Indication_x`,
+                 Deletion_class, Deletion_Type = Deletion_brkpt,
+                 Deletion_other, CHD_label, CHD_grade, CHD_type) %>%
+         group_by(participant, VCFS_id, sex, age_days, year_of_scan) %>%
+         mutate(Clin_ind_combined = paste0(unique(Clin_ind), collapse = ";"))  %>%
+         summarize(across(Deletion_class:Clin_ind_combined,first)) %>%
+         ungroup()
+```
+
+```{r}
+#| label: merge-clinical-data-with-centiles
+#| output: false
+clinical_df <- right_join(extra_clinical_data, df) %>%
+                                    mutate(Source = "CHOP")
+```
+
+### Exclude based on clinical read
+
+We will now exclude 22q scans based on neuroradiology read for pathology that might impact segmentation
+
+```{r}
+#| label: load-clinical-read-assessments
+#| output: false
+library(readxl)
+# Load in neuroradiologist clinical reads
+neurorad_assessment_file <- "../data/CHOP/22q_clinical_mris/22q_ClinicalReads_updated3.xlsx"
+neurorad_df <- read_excel(neurorad_assessment_file) %>%
+              mutate(participant = glue("sub-{ID2}")) %>%
+              mutate(participant = str_replace_all(participant,"22q_","22q")) %>%
+              mutate(ID2_ses = str_replace_all(ID2_ses,"22q_","22q"))
+
+# Some clinical reads are based on session, while others are based on subject, we'll need to split those for now
+neurorad_df_session <- neurorad_df %>% filter(grepl("_ses-",ID2_ses))
+neurorad_df_sub <- neurorad_df %>% filter(!grepl("_ses-",ID2_ses)) %>% select(-c(ID2_ses))
+
+# Create a list of all sessions
+tmp_join <- clinical_df %>%
+                select(participant, session_id) %>%
+                distinct() %>%
+                mutate(ID2_ses = str_remove_all(glue("{participant}_{session_id}"),"sub-"))
+
+# Modify neurorad_df_sub to have session data (assuming all data applies equally)
+neurorad_df_sub <- neurorad_df_sub %>% left_join(tmp_join)
+
+# Rejoin data
+neurorad_df <- bind_rows(neurorad_df_session, neurorad_df_sub) %>%
+              drop_na(ID2_ses)
+
+neurorad_df_join <- neurorad_df %>%
+                    select(participant, ID2_ses,
+                           `Gestalt Normal/Abnormal`, `Volume Loss`,
+                           `Qualitative Cortical Thickness`)
+```
+
+```{r}
+#| label: code-pathology-from-clinical-reads
+clinical_df <- clinical_df %>%
+                      mutate(ID2_ses = str_remove_all(glue("{participant}_{session_id}"),"sub-")) %>%
+                      left_join(neurorad_df_join)
+
+table(clinical_df$`Gestalt Normal/Abnormal`, useNA = "ifany")
+
+# The pathology indicator has some variation, so make a list of oks and not oks
+no_pathology_list <- c('N','N (brain; serious A for orbits)','N (note aracnnoid cyst might affect segmentation)')
+pathology_list <- c('A','A (LSPINE)')
+
+# Code for pathology
+clinical_df <- clinical_df %>%
+                  mutate(pathology = case_match(`Gestalt Normal/Abnormal`,
+                                                no_pathology_list ~ "Normal",
+                                                pathology_list ~ "Abnormal",
+                                                .default = "Missing"))
+
+clinical_df$pathology[clinical_df$dx == "CN"] <- NA
+
+print(glue("Abnormal Pathology: {length(unique(clinical_df$participant[clinical_df$pathology == 'Abnormal']))}"))
+print(glue("Normal Pathology: {length(unique(clinical_df$participant[clinical_df$pathology == 'Normal']))}"))
+print(glue("Other Pathology: {length(unique(clinical_df$participant[clinical_df$pathology == 'Other']))}"))
+print(glue("Missing Pathology: {length(unique(clinical_df$participant[clinical_df$pathology == 'Missing']))}"))
+```
+
+```{r}
+#| label: summarize-pathology-by-session
+print(glue("Abnormal Pathology: {length(unique(clinical_df$session_id[clinical_df$pathology == 'Abnormal']))}"))
+print(glue("Normal Pathology: {length(unique(clinical_df$session_id[clinical_df$pathology == 'Normal']))}"))
+print(glue("Other Pathology: {length(unique(clinical_df$session_id[clinical_df$pathology == 'Other']))}"))
+print(glue("Missing Pathology: {length(unique(clinical_df$session_id[clinical_df$pathology == 'Missing']))}"))
+```
+
+### Convert from Long to Wide
+
+```{r}
+#| label: extract-slip-reference-curves
+#| output: false
+# Extract relevant centile lines for each feature to plot later
+slip_curves <- clinical_df %>%
+                  ungroup() %>%
+                  filter(dx == "CN") %>%
+                  select(name = phenotype, AgeTransformed, sex,
+                       PRED.m500.pop, PRED.l025.pop,
+                       PRED.u975.pop) %>%
+                  distinct()
+```
+
+```{r}
+#| label: organize-patient-centiles
+#| output: false
+
+# Remove the centile lines and just keep the patient data
+clinical_df <- clinical_df %>%
+                      select(-c(PRED.l025.pop:PRED.u975.pop)) %>%
+                      pivot_wider(id_cols = c(participant:site,euler:pathology),
+                                  names_from = phenotype,
+                                  values_from = c(centile,normalised_value),
+                                  names_glue = "{phenotype}Transformed.{.value}") %>%
+                     filter(!is.na(GMVTransformed.centile))
+
+# Rename centile columns
+colnames(clinical_df) <- colnames(clinical_df) %>%
+                            str_replace_all("Transformed.centile","Transformed.q.wre") %>%
+                            str_replace_all("Transformed.normalised_value","Transformed.normalised")
+```
+
+### Include SLIP cohort as controls
+
+We can use the SLIP cohort as controls. The SLIP data vastly outnumbers the 22q data, so we can match by age and sex.
+
+```{r}
+#| label: filter-slip-controls-by-age
+#| output: false
+#| 
+
+# As a rough first-pass, let's limit matching to within the age window of the 22q samples
+age_min_22q <- min(clinical_df$age_days[clinical_df$dx == "22q11DS"])
+age_max_22q <- max(clinical_df$age_days[clinical_df$dx == "22q11DS"])
+clinical_df <- clinical_df %>%
+                    filter(age_days >= age_min_22q - 30,
+                           age_days <= age_max_22q + 180)
+
+# If a SLIP individual has more than one scan, select only one
+clinical_df <- clinical_df[sample(1:nrow(clinical_df)),]
+clinical_df <- clinical_df %>%
+                  filter(!duplicated(participant) | dx == "22q11DS",
+                         !is.na(dx)) %>%
+                  mutate(age_at_scan = as.numeric(str_extract(session_id,"(?<=procId)\\d+(?=ageDays)")))
+```
+
+## Standardize Deletions
+
+```{r}
+#| label: update-deletion-type-classification
+
+# Compare initial deletion definitions with latest 22q and You deletion definitions
+vcfs_df <- read_excel("../data/CHOP/22q_clinical_mris/22qDS_Language-Speech-IQ-CARDIAC-RACE_MRI_2025-09-03.xlsx", sheet = 2)
+clinical_df <- left_join(clinical_df, vcfs_df %>%
+                  select(VCFS_id,`22q_brkpt`, race, ethnicity))
+
+# There are two sources of deletion-type in the provided data. vcfs_df is more up-to-date so we will default to that
+
+# Deletion Other
+clinical_df$Deletion_Type[clinical_df$Deletion_other == "A-almost B" & !is.na(clinical_df$Deletion_other)] <- "A-B"
+clinical_df$Deletion_Type[clinical_df$Deletion_other == "pter-B; unbalanced translocation 17:22" &
+                          !is.na(clinical_df$Deletion_other)] <- "pter-B"
+
+table(clinical_df$Deletion_Type, clinical_df$`22q_brkpt`)
+
+# Breakpoint formatting
+clinical_df$Deletion_Type[clinical_df$VCFS_id %in%
+                            (vcfs_df %>% filter(`22q_brkpt` == "A-D", !is.na(`22q_brkpt`)) %>% pull(VCFS_id))] <- "A-D"
+clinical_df$Deletion_Type[clinical_df$VCFS_id %in%
+                            (vcfs_df %>% filter(`22q_brkpt` == "FISH only", !is.na(`22q_brkpt`)) %>% pull(VCFS_id))] <- "FISH"
+clinical_df$Deletion_Type[clinical_df$dx == "22q11DS" & is.na(clinical_df$Deletion_Type)] <- "FISH"
+clinical_df$Deletion_Type[clinical_df$dx == "CN"] <- "None"
+
+table(clinical_df$Deletion_Type)
+table(clinical_df$Deletion_Type, clinical_df$`22q_brkpt`)
+```
+
+```{r}
+#| label: exclude-atypical-deletions-and-age
+# Exclude atypical deletions and scans older than 21 years
+clinical_df <- clinical_df %>%
+                    filter((Deletion_Type %in% c("A-D","None")),
+                           age_days <= ((21*365.25) + 280))
+
+table(clinical_df$Deletion_Type, clinical_df$Source, clinical_df$dx, useNA = "ifany")
+```
+
+## Match SLIP with 22q
+
+```{r}
+#| label: match-slip-controls-to-22q
+library(MatchIt)
+
+clinical_df$tmp_site <- clinical_df$site
+clinical_df$tmp_site[!(clinical_df$site %in% names(table(clinical_df$site[clinical_df$dx == "22q11DS"]))) |
+                     !(clinical_df$site %in% names(table(clinical_df$site[clinical_df$dx == "CN"]))) ] <- "other"
+clinical_df$tmp_site <- factor(clinical_df$tmp_site)
+
+
+m.out <- matchit(factor(dx, levels = c("CN","22q11DS")) ~ age_days, data = clinical_df,
+                exact = ~sex + tmp_site, ratio = 2)
+
+table(clinical_df$tmp_site,clinical_df$dx, useNA = "ifany")
+matched_df <- match.data(m.out) %>%
+                dplyr::select(participant, sex, age_days, dx) %>%
+                mutate(matched = TRUE)
+
+clinical_df <- left_join(clinical_df, matched_df) %>%
+                  mutate(matched = ifelse(is.na(matched), FALSE, matched),
+                         matched = ifelse(dx == "22q11DS", TRUE, matched))
+```
+
+```{r}
+#| label: plot-match-jitter-diagnostics
+#| fig-cap: "Propensity score jitter plot for the MatchIt matching of SLIP controls to 22q11DS cases."
+plot(m.out, type = "jitter", interactive = FALSE)
+```
+
+```{r}
+#| label: plot-match-density-diagnostics
+#| fig-cap: "Balance of sex, age and site before and after matching SLIP controls to 22q11DS cases."
+plot(m.out, type = "density", interactive = FALSE,
+     which.xs = ~sex + age_days + tmp_site)
+```
+
+## Save CHOP Analysis Dataset
+
+```{r}
+#| label: save-chop-data-csvs
+#| output: false
+write.csv(clinical_df, glue('../data/CHOP/CHOP_data{suf}.csv'), row.names = F)
+print(dim(clinical_df))
+```
+
+## Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

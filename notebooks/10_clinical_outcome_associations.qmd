@@ -1,0 +1,347 @@
+---
+title: "Clinical Outcome Associations (Figures S12, S23)"
+author: "Benjamin Jung, PhD"
+format:
+  pdf:
+    documentclass: scrreprt
+    toc: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: visual
+---
+
+## Load LMSz Data
+
+```{r}
+#| label: load-lmsz-deviation-data
+#| echo: false
+#| output: false
+source("util_scripts/utils.R")
+
+load('../data/analysis_prep_combined.RData')
+
+# CHOP_data_lmsz.csv carries the syndrome-specific (LMSz) deviation scores built
+# in 09_syndrome_specific_growth_charts.qmd; this script must run after that one.
+df <- read_csv("../data/CHOP/CHOP_data_lmsz.csv", show_col_types = F) %>%
+          select(-contains("Transformed.q.wre"),
+                 -contains("atypicality"))
+
+colnames(df)[grepl("Transformed.q.zscore",colnames(df))] <- str_replace_all(colnames(df)[grepl("Transformed.q.zscore",colnames(df))],
+                                                                            "zscore","zorig")
+
+# LMSz centiles -> standardized deviation scores (qnorm), matching how SLIP/LBCC
+# centiles are converted elsewhere; nudge exact 0/1 centiles off the boundary
+# since qnorm(0)/qnorm(1) are +-Inf
+zscores <- df %>%
+              select(contains("Transformed.q.lmsz")) %>%
+              mutate(across(everything(), .fns = ~ ifelse(. == 1, 0.9999999999999999, .)),
+                     across(everything(), .fns = ~ ifelse(. == 0, 0.0000000000000001, .)),
+                     across(everything(), qnorm))
+
+colnames(zscores) <- str_replace_all(colnames(zscores), "Transformed.q.lmsz",
+                                     "Transformed.q.zscore")
+df <- bind_cols(df, zscores) %>%
+          filter(Deletion_Type == "A-D")
+```
+
+```{r}
+#| label: define-test-phenotypes
+#| output: false
+# Define global phenotypes to test
+# CT excluded (limited sample size)
+test_phenos <- c("eTIV","GMV","sGMV","WMV","Ventricles","Cerebellum.all","totalSA")
+test_labels <- c("ICV","GMV","sGMV","WMV","Ventricles","Cerebellum","Total SA")
+```
+
+## Cognitive and Language Score Associations (Figure S12)
+
+### Prepare Language and IQ Scores
+
+```{r}
+#| label: load-iq-language-scores
+#| output: false
+library(readxl)
+
+# Perform a simple non-covariate adjusted model (covariates already accounted for in LMSz model)
+covs <- ""
+info_df <- read_excel("../data/CHOP/22q_clinical_mris/22qDS_Language-Speech-IQ_MRI_2025-05-23.xlsx",2) %>%
+                select(-c(SLP_TPs, IQ_TPs))
+
+# Load speech and language scores
+lang_df <- info_df %>%
+            right_join(
+              read_excel("../data/CHOP/22q_clinical_mris/22qDS_Language-Speech-IQ_MRI_2025-05-23.xlsx",3),
+              by = c("VCFS_ID_clean" = "vcfs_id")) %>%
+              mutate(age_at_test = as.numeric(eval_date - dob)) %>%
+              select(-c(dob, eval_date)) %>%
+              relocate(age_at_test, .after = VCFS_ID_clean)
+
+# Load IQ scores
+iq_df <- info_df %>%
+            right_join(
+              read_excel("../data/CHOP/22q_clinical_mris/22qDS_Language-Speech-IQ_MRI_2025-05-23.xlsx",4),
+              by = c("VCFS_ID_clean" = "vcfs_id")) %>%
+              mutate(age_at_test = as.numeric(iq_date - dob)) %>%
+              select(-c(dob, iq_date)) %>%
+              relocate(age_at_test, .after = VCFS_ID_clean)
+```
+
+### Clinical Evaluation of Language Fundamentals (CELF)
+
+```{r}
+#| label: merge-celf-scores
+#| output: false
+# Merge on closest date
+lmsz_lang_df <- df %>% left_join(lang_df , by= "VCFS_id", relationship = "many-to-many") %>%
+                    mutate(dif = abs(age_at_scan - age_at_test)) %>%
+                    group_by(VCFS_id, age_days) %>%
+                    filter(!is.na(celf_core)) %>%
+                    filter(dif == min(dif)) %>%
+                    arrange(dif) %>%
+                    filter(!duplicated(participant)) %>%
+                    ungroup()
+```
+
+```{r}
+#| label: fit-celf-association-models
+for (measure in c("celf_core")) {
+  for (pheno in test_phenos) {
+    model <- lm(as.formula(glue("{pheno}Transformed.q.zscore ~ {measure}{covs}")), lmsz_lang_df)
+    res <- tidy(model, 
+                conf.int = T)
+    res$pheno <- pheno
+    res$n_sample <- sum(!is.na(lmsz_lang_df[[measure]]))
+    res$df <- insight::get_df(model, "residual")
+    if (pheno == test_phenos[1] & measure == "celf_core") {
+      res_all <- res
+    } else {
+      res_all <- bind_rows(res_all, res)
+    }
+  }
+}
+
+res_all <- res_all %>% 
+              filter(!(term %in% c("(Intercept)"))) %>% 
+              select(pheno, term, statistic, estimate, conf.low, conf.high, 
+                     p.value, df, n_sample) %>%
+              arrange(p.value) %>%
+              mutate(test = "CELF")
+res_all
+res_combined <- res_all
+```
+
+### Preschool Language Scale (PLS)
+
+```{r}
+#| label: merge-pls-scores
+#| output: false
+# Merge on closest date
+lmsz_lang_df <- df %>% left_join(lang_df , by= "VCFS_id", relationship = "many-to-many") %>%
+                    mutate(dif = abs(age_at_scan - age_at_test)) %>%
+                    group_by(VCFS_id, age_days) %>% 
+                    filter(!is.na(pls_total)) %>%
+                    filter(dif == min(dif)) %>%
+                    arrange(dif) %>%
+                    filter(!duplicated(participant)) %>%
+                    ungroup()
+```
+
+```{r}
+#| label: fit-pls-association-models
+for (measure in c("pls_total")) {
+  for (pheno in test_phenos) {
+    model <- lm(as.formula(glue("{pheno}Transformed.q.zscore ~ {measure}{covs}")), lmsz_lang_df)
+    res <- tidy(model, 
+                conf.int = T)
+    res$pheno <- pheno
+    res$n_sample <- sum(!is.na(lmsz_lang_df[[measure]]))
+    res$df <- insight::get_df(model, "residual")
+    if (pheno == test_phenos[1] & measure == "pls_total") {
+      res_all <- res
+    } else {
+      res_all <- bind_rows(res_all, res)
+    }
+  }
+}
+
+
+res_all <- res_all %>% 
+              filter(!(term %in% c("(Intercept)"))) %>% 
+              select(pheno, term, statistic, estimate, conf.low, conf.high, 
+                     p.value, df, n_sample) %>%
+              arrange(p.value) %>%
+              mutate(test = "PLS")
+res_all
+res_combined <- bind_rows(res_combined, res_all)
+```
+
+### IQ
+
+```{r}
+#| label: merge-iq-scores
+#| output: false
+lmsz_iq_df <- df %>% left_join(iq_df , by= "VCFS_id", relationship = "many-to-many") %>%
+                    mutate(dif = abs(age_at_scan - age_at_test)) %>%
+                    group_by(VCFS_id, age_days) %>% 
+                    filter(dif == min(dif)) %>%
+                    arrange(dif) %>%
+                    filter(!duplicated(participant)) %>%
+                    ungroup()
+```
+
+```{r}
+#| label: fit-iq-association-models
+for (measure in c("fsiq","viq","piq")) {
+  for (pheno in test_phenos) {
+    model <- lm(as.formula(glue("{pheno}Transformed.q.zscore ~ {measure}{covs}")), lmsz_iq_df)
+    res <- tidy(model, 
+                conf.int = T)
+    res$pheno <- pheno
+    res$n_sample <- sum(!is.na(lmsz_iq_df[[measure]]))
+    res$df <- insight::get_df(model, "residual")
+    if (pheno == test_phenos[1] & measure == "fsiq") {
+      res_all <- res
+    } else {
+      res_all <- bind_rows(res_all, res)
+    }
+  }
+}
+
+
+res_all <- res_all %>% 
+              filter(!(term %in% c("(Intercept)"))) %>% 
+              select(pheno, term, statistic, estimate, conf.low, conf.high, 
+                     p.value, df, n_sample) %>%
+              arrange(p.value) %>%
+              mutate(test = "IQ")
+res_all
+res_combined <- bind_rows(res_combined, res_all)
+```
+
+### Assemble Figure
+
+```{r}
+#| label: build-summary-plot-data
+#| output: false
+library(ggh4x)
+
+# Builds the Figure S12 panel layout: one facet column per test (VIQ/PIQ/FSIQ/
+# CELF/PLS), estimates from the global deviation-score ~ score linear models above.
+res_formatted <- res_combined %>%
+                    mutate(term = case_match(term,
+                                "celf_core" ~ glue("CELF (n={n_sample})"),
+                                "fsiq" ~ glue("FSIQ (n={n_sample})"),
+                                "piq" ~ glue("PIQ (n={n_sample})"),
+                                "viq" ~ glue("VIQ (n={n_sample})"),
+                                "pls_total" ~ glue("PLS (n={n_sample})")),
+                           test = case_match(test,
+                                "CELF" ~ "Speech/Language",
+                                "PLS" ~ "Speech/Language",
+                                "IQ" ~ "IQ"),
+                           test = factor(test, levels = c("IQ","Speech/Language")),
+                           pheno = factor(pheno, levels = test_phenos,
+                                          labels = test_labels),
+                           term = factor(term, levels =
+                                          c("FSIQ (n=33)","PIQ (n=27)","VIQ (n=27)",
+                                            "PLS (n=58)","CELF (n=48)"))) %>%
+                    na.omit()
+
+p_summary <- ggplot(res_formatted,
+    aes(y = estimate, x = pheno, color = pheno)) +
+    geom_hline(yintercept = 0) +
+    geom_point(position = position_dodge(1)) + 
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                  position = position_dodge(1)) +
+    theme_pubclean() + 
+    xlab("") + ylab("Estimate") +
+    facet_nested(~ test + term) +
+    scale_x_discrete(breaks = c()) +
+    theme(legend.position = "bottom",
+          legend.title = element_blank()) + 
+    guides(colour = guide_legend(nrow = 1)) + figure_theme
+```
+
+```{r, fig.width=6.69, fig.height=3.5}
+#| label: save-figure-s12-summary-plot
+#| echo: false
+#| fig-cap: "Figure S12. Associations between global LMSz deviation scores and cognitive (FSIQ, PIQ, VIQ) and language (CELF, PLS) scores."
+p_summary
+
+ggsave("../figures_final/png/figure_s12_cognitive_language_associations.png")
+ggsave("../figures_final/pdf/figure_s12_cognitive_language_associations.pdf")
+```
+
+## Congenital Heart Defect Associations (Figure S13)
+
+```{r}
+#| label: prepare-chd-data
+#| output: false
+df_chd <- df %>%
+            arrange(age_days) %>%
+            filter(!duplicated(participant)) %>%
+          filter(Source == "CHOP",
+                 dx == "22q11DS") %>%
+          mutate(CHD_binary = case_when(CHD_grade > 0 ~ TRUE,
+                                        CHD_grade == 0 ~ FALSE,
+                                        .default = NA),
+                 CHD_grade = ifelse(CHD_grade == 99, NA, CHD_grade))
+
+```
+
+```{r}
+#| label: fit-chd-brain-association-models
+# CHD status and CHD severity grade, each tested per global brain measure
+loop_flag <- F
+for (m in c("WMV","GMV","sGMV","Ventricles","totalSA","Cerebellum.all")) {
+  for (chd_feat in c("CHD_binary","CHD_grade")) {
+    res <- tidy(lm(as.formula(glue("{m}Transformed.q.zscore ~ {chd_feat} + age_days + sex")), df_chd),
+                conf.int = T) %>%
+              mutate(measure = m,
+                     term = str_remove_all(term,"TRUE"))
+    if (loop_flag) {
+      res_all <- bind_rows(res_all, res)
+    } else {
+      res_all <- res
+      loop_flag <- T
+    }
+  }
+}
+res_all <- res_all %>% arrange(p.value) %>%
+         filter(grepl("CHD",term)) %>%
+         mutate(term = factor(term, levels = c("CHD_binary","CHD_grade"),
+                              labels = c("CHD Status", "CHD Grade")),
+                measure = factor(measure, levels = c("eTIV","GMV","sGMV","WMV",
+                                                     "Cerebellum.all", "Ventricles",
+                                                     "totalSA","meanCT")),
+                p.adj = p.adjust(p.value, method = "fdr"))
+```
+
+```{r, fig.height = 3, fig.width = 6.69}
+#| label: plot-chd-associations-figure-s13
+#| fig-cap: "Figure S23. Associations between global LMSz deviation scores and congenital heart defect status and grade (estimates with 95% confidence intervals)."
+ggplot(res_all,
+       aes(x = term, y = estimate,
+           color = measure, group = measure)) +
+    geom_point(position = position_dodge(0.7)) +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high),
+                  position = position_dodge(0.7)) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    theme_pubr() + ylab("Estimate") + xlab("") +
+    theme(legend.position = "none") +
+    figure_theme
+
+ggsave("../figures_final/png/figure_s13_chd_associations.png")
+ggsave("../figures_final/pdf/figure_s13_chd_associations.pdf")
+```
+
+## 
+
+## Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

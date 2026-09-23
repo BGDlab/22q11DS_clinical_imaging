@@ -1,0 +1,1067 @@
+---
+title: "Gene Expression Correlation Analysis (Figure 3)"
+author: "Benjamin Jung, PhD"
+format:
+  pdf:
+    documentclass: scrreprt
+    toc: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r}
+#| label: setup-environment
+#| output: false
+library(reticulate)
+library(DescTools)
+library(doRNG)
+source("util_scripts/utils.R")
+load('../data/analysis_prep_combined.RData')
+```
+
+## Load Data
+
+```{r}
+#| label: load-cohens-d
+#| output: false
+
+ind_df <- df
+
+chop_cohens_df <- read_csv("../tables/chop_cohens.csv", show_col_types = F) %>%
+                      select(label, Cohens_d_CHOP = Cohens_d)
+enig_cohens_df <- read_csv("../tables/enigma_cohens.csv", show_col_types = F) %>%
+                      select(label, Cohens_d_ENIGMA = Cohens_d)
+
+df <- inner_join(chop_cohens_df, enig_cohens_df) %>%
+          mutate(feature = str_remove_all(label,"GM\\.|SA\\.|CT\\.|SUBC\\."))
+```
+
+### Get Neuromaps
+
+```{python}
+#| label: parcellate-abagen-pc1
+#| output: false
+from util_scripts import parcellation_util
+import pandas as pd
+from neuromaps import datasets, images, nulls, resampling, stats
+from neuromaps.datasets import fetch_annotation
+from neuromaps.parcellate import Parcellater
+
+parcellation, dk_info = parcellation_util.define_parcellation()
+
+# 'abagen' annotation = first principal component (PC1) of AHBA gene expression,
+# pre-computed by neuromaps and parcellated below to the same atlas as the deviation maps
+abagen = fetch_annotation(source='abagen')
+
+parc = Parcellater(parcellation, "fsaverage")
+abagen_parc = parc.fit_transform(abagen, "fsaverage")
+```
+
+```{r}
+#| label: join-abagen-pc1-to-df
+#| output: false
+dk_info = py$dk_info
+dk_info <- dk_info %>% mutate(abagen = py$abagen_parc) %>% select(hemi_label, abagen)
+
+df <- df %>% left_join(dk_info, by = c("feature" = "hemi_label"))
+```
+
+```{r}
+#| label: define-run-gradient-function
+#| output: false
+library(matrixTests)
+library(data.table)
+library(dtplyr)
+
+# ---- called once per gene, reusing perm_mat ----
+run_gradient <- function(raw_df, brain_map, map_col, perm_mat, method = "pearson") {
+  corr_df <- raw_df %>%
+    select(participant, dx, 
+           any_of(glue("{brain_map$label}Transformed.q.zscore"))) %>%
+    drop_na() %>%
+    pivot_longer(contains("zscore"), names_to = "label", 
+                 values_to = "zscore") %>%
+    mutate(label = str_remove(label, "Transformed.q.zscore")) %>%
+    left_join(brain_map, by = "label") %>%
+    rename(map = {{ map_col }}) %>%
+    group_by(participant, dx) %>%
+    summarize(corr = cor(zscore, map, method = method, use = "complete.obs"),
+              .groups = "drop") %>%
+    mutate(z = FisherZ(corr)) %>%
+    filter(is.finite(z)) %>%
+    as.data.table()
+
+  # catches silent misalignment if this gene dropped different participants
+  stopifnot(nrow(corr_df) == nrow(perm_mat))
+
+  z  <- corr_df$z
+  g1 <- corr_df$dx == "22q11DS"
+  n1 <- sum(g1)
+  n2 <- length(z) - n1
+
+  # calculate observed t-statistic
+  obs      <- col_t_welch(matrix(z[g1], ncol = 1), matrix(z[!g1], ncol = 1))
+  t_actual <- obs$statistic
+  # calculate median correlation with brain map
+  corr_case <- median(corr_df$corr[g1])
+  corr_cont <- median(corr_df$corr[!g1])
+  
+  # Calculate t-statistic for every permutation 
+  Z_full <- matrix(z, nrow = length(z), ncol = ncol(perm_mat))
+  x_mat  <- matrix(Z_full[perm_mat],  nrow = n1)
+  y_mat  <- matrix(Z_full[!perm_mat], nrow = n2)
+  t_perm   <- col_t_welch(x_mat, y_mat)$statistic
+  
+  # Find number of instances where permutation exceeds actual t
+  p <- (1 + sum(abs(t_perm) >= abs(t_actual))) / (length(t_perm) + 1)
+
+  list(map = map_col,
+       corr_case = corr_case,
+       corr_cont = corr_cont,
+       t = t_actual, p = p,
+       actual_corrs = corr_df)
+}
+```
+
+```{r}
+#| label: precompute-permutation-matrices
+#| output: false
+# Precalculate permutations
+set.seed(2514)
+n_perm <- 10000
+# CHOP - All Samples
+df_chop_full <- ind_df %>% filter(Source == "CHOP")
+perm_mat_chop_full <- replicate(n_perm, sample(df_chop_full$dx == "22q11DS"))
+# CHOP - CT subset
+df_chop_mpr <- ind_df %>% filter(Source == "CHOP", !is.na(meanCTTransformed.q.zscore))
+perm_mat_chop_mpr <- replicate(n_perm, sample(df_chop_mpr$dx == "22q11DS"))
+# ENIGMA
+df_enigma <- ind_df %>% filter(Source == "ENIGMA")
+perm_mat_enigma <- replicate(n_perm, sample(df_enigma$dx == "22q11DS"))
+```
+
+## Correlate Deviation Maps with AHBA PC1
+
+```{r}
+#| label: pc1-correlation-permutation-test
+maps <- c("abagen")
+cats = c("GM","SA","CT")
+cohorts <- c("CHOP","ENIGMA")
+
+res <- expand_grid(measure = cats, map = maps, Source = cohorts)
+res$t <- NA
+res$corr_case <- NA
+res$corr_cont <- NA
+res$p    <- NA
+actual_corrs <- list()
+
+for (i in 1:nrow(res)) {
+  # Define permutation matrix and data matrix
+  if (res$Source[i] == "CHOP") {
+    if (res$measure[i] != "CT") {
+      df_test <- df_chop_full
+      perm_mat <- perm_mat_chop_full
+    } else {
+      df_test <- df_chop_mpr
+      perm_mat <- perm_mat_chop_mpr
+    }
+  } else {
+    df_test <- df_enigma
+    perm_mat <- perm_mat_enigma
+  }
+  # Define brain map
+  brain_map <- df %>% 
+                select(label, all_of(res$map[i])) %>% 
+                filter(grepl(glue("{res$measure[i]}\\."), label))
+  
+  perm_res <- run_gradient(df_test, brain_map, res$map[i], perm_mat, method = "pearson")
+  res[i, "t"] <- perm_res$t
+  res[i, "corr_case"] <- perm_res$corr_case
+  res[i, "corr_cont"] <- perm_res$corr_cont
+  res[i, "p"] <- perm_res$p
+  actual_corrs[[i]]  <- perm_res$actual_corrs %>% mutate(measure = res$measure[i],
+                                                         Source = res$Source[i],
+                                                         map = res$map[i])
+}
+
+print(res %>% arrange(Source, map, measure))
+actual_corrs <- bind_rows(actual_corrs)
+```
+
+```{r}
+#| label: build-correlation-bar-plots
+#| fig-cap: "Distribution of individual-level correlations between regional deviation scores and the AHBA gene expression PC1 map (CHOP cohort), by diagnostic group and brain measure."
+corr_plots_bar <- function(corrs, brain_map = NULL) {
+  ggplot(corrs %>%
+                 mutate(dx = factor(dx, levels = c("22q11DS","CN"), 
+                                    labels = c("22q11DS","Control")),
+                        measure = factor(measure, levels = c("GM","SA","CT"), 
+                                    labels = c("Gray Matter Volume","Surface Area",
+                                               "Cortical Thickness"))), 
+               aes(x = dx, y = corr)) + 
+          geom_hline(yintercept = 0, linetype = "dashed") +
+          geom_boxplot() + 
+          theme_pubclean() +
+          xlab("") +
+          ylab("Pearson's r") +
+          theme(
+              strip.background = element_rect(fill = "grey92", color = NA),
+              strip.text        = element_text(face = "bold", size = 10, color = "black"),
+              strip.text.y      = element_text(angle = 270)
+            ) + aes(fill = dx) + 
+          scale_fill_manual(values = c("22q11DS" = "firebrick", 
+                                       "Control" = "grey60"), 
+                            guide = "none")
+  
+}
+
+bar_plots <- list()
+for (source in c("CHOP","ENIGMA")) {
+  bar_plots[[source]] <- list()
+  for (cat in cats) {
+    corr_data <- actual_corrs %>% 
+                    filter(Source == "CHOP", map == "abagen", measure == cat)
+    
+    bar_plots[[source]][[cat]] <- corr_plots_bar(corr_data)
+  }
+}
+
+
+ggplot(actual_corrs %>% 
+         filter(Source == "CHOP", map == "abagen") %>%
+         mutate(dx = factor(dx, levels = c("22q11DS","CN"), 
+                            labels = c("22q11DS","Control"))), 
+       aes(x = corr)) + 
+  geom_histogram() + 
+  facet_grid(dx ~ measure) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  theme_pubclean()
+```
+
+```{r}
+#| label: build-brain-atlas-deviation-maps
+#| output: false
+plot_df <- ind_df %>%
+            select(dx, Source, contains("Transformed.q.zscore")) %>%
+            pivot_longer(contains("Transformed.q.zscore"), 
+                         names_to = "label", values_to = "brain_score") %>%
+            mutate(label = str_remove_all(label,"Transformed.q.zscore"),
+                   feature = str_remove_all(label,"GM\\.|SA\\.|CT\\.|SUBC\\.")) %>%
+            group_by(dx, label, Source) %>%
+            summarize(brain_score = median(brain_score, na.rm = T)) %>%
+            filter(dx == "22q11DS") %>%
+            inner_join(df %>% select(label, feature, abagen)) %>%
+            mutate(measure = case_when(grepl("GM\\.",label) ~ "GM",
+                                       grepl("SA\\.",label) ~ "SA",
+                                       grepl("CT\\.",label) ~ "CT",
+                                       grepl("SUB\\.",label) ~ "SUBC"))
+
+plots <- list()
+for (cohort in c("CHOP","ENIGMA")) {
+  plots[[cohort]] <- list()
+  for (m in c("GM","SA","CT","abagen")) {
+    if (m %in% c("GM","SA","CT")) {
+      rm_text <- glue("{m}\\.")
+      fill_text <- "brain_score"
+      leg_title <- "Deviation"
+      plot_lims <- c(-1.8, 1.8)
+      c_bar <- c("royalblue","white","firebrick")
+    } else {
+      rm_text <- "GM\\."
+      fill_text <- m
+      c_bar <- c("purple","white","yellow")
+      plot_lims <- c(-2.5, 2.5)
+      leg_title <- "Gene PC1"
+    }
+    p <- plot_brain_atlas(plot_df %>%
+                     filter(grepl(rm_text, label),
+                            Source == cohort) %>%
+                     mutate(label = str_remove_all(label,rm_text)), 
+                   dk_plot, fill_text, plot_lims = plot_lims,
+                   color_scheme = c_bar, position = "stacked")
+    
+    
+    plots[[cohort]][[m]] <- p$plot + 
+                              guides(fill = guide_colorbar(title = leg_title, title.position = "left"),
+                                     color = "none") + 
+                              theme(legend.position = "right",
+                                    legend.title = element_text(angle = 90, hjust = 0.5))
+  }
+}
+
+
+```
+
+## Per-Gene Correlation Across All Brain-Expressed Genes
+
+<https://www-sciencedirect-com.proxy.library.upenn.edu/science/article/pii/S1053811919300114#sec3>
+
+```{python}
+#| label: fetch-desikan-killiany-atlas
+#| output: false
+import abagen
+atlas = abagen.fetch_desikan_killiany(surface = True)
+atlas_info = pd.read_csv(atlas["info"])
+```
+
+```{python}
+#| label: get-donor-level-expression-stable-genes
+#| output: false
+exp_donors = abagen.get_expression_data(atlas["image"], atlas["info"], 
+                    ibf_threshold = 0.5, missing = None, 
+                    return_donors = True)
+                    
+exp_donors = list(exp_donors.values())
+
+# Define the 50% most stable genes (i.e., the most likely to be brain expressed)
+exp_filtered = abagen.keep_stable_genes(exp_donors, threshold=0.5)
+
+```
+
+```{python}
+#| label: check-donor-count
+#| output: false
+len(exp_donors)
+```
+
+```{r}
+#| label: load-22q-locus-genes
+#| output: false
+# Get 22q genes
+genes_22q_df <- read_csv("../data/hg38.tracks.csv", show_col_types = F) %>%
+                    filter(gene_type == "protein-coding gene") %>%
+                    select(chr,start,end, gene, gene_long)
+genes_list_22q <- genes_22q_df$gene
+```
+
+```{python}
+#| label: get-mean-gene-expression
+#| output: false
+exp = abagen.get_expression_data(atlas["image"], atlas["info"], 
+            ibf_threshold = 0.5,missing = None)
+```
+
+```{python}
+#| label: subset-22q-gene-expression
+#| output: false
+exp_22q = exp.loc[:,exp.columns.isin(r.genes_list_22q)]
+print(exp_22q.shape)
+```
+
+```{python}
+#| label: filter-stable-genes-22q-subset
+#| output: false
+# Keep only the 50% most stable genes
+exp = exp.loc[:,exp_filtered[0].columns]
+exp_22q = exp.loc[:,exp.columns.isin(r.genes_list_22q)]
+print(exp_22q.shape)
+```
+
+```{r}
+#| label: build-region-labeled-expression-table
+#| output: false
+exp2 = tibble(rownames_to_column(py$exp, var = "id"))
+
+# Left-hemisphere cortical regions only; build hemi-prefixed region labels
+# (lh_/rh_) to match the deviation-score column naming used elsewhere
+atlas_info <- py$atlas_info %>%
+                  filter(hemisphere == "L", structure == "cortex") %>%
+                  mutate(id = as.character(id))
+
+exp2 = inner_join(atlas_info,
+                 exp2) %>% 
+            mutate(label = glue("{hemisphere}_{label}"),
+                   label = str_replace_all(label, "L_","lh_"),
+                   label = str_replace_all(label, "R_","rh_")) %>%
+            as_tibble() %>%
+            select(-c(hemisphere, structure, id))
+```
+
+```{r}
+#| label: join-expression-with-cohens-d
+#| output: false
+res_exp <- read_csv("../tables/chop_cohens.csv", show_col_types = F) %>% 
+              filter(grepl("lh_",label)) %>%
+              select( label, Cohens_d) %>% 
+              mutate(feature = label) %>%
+              separate_wider_delim(label, delim = ".", names = c("measure", "label"), 
+                                   too_few = "align_end") %>%
+              inner_join(exp2)
+
+res_exp <- res_exp %>%
+                mutate(feature = label,
+                       label = glue("{measure}.{label}"))
+```
+
+```{r}
+#| label: init-gene-results-table
+#| output: false
+# gene_22q flags genes that fall within the 22q11.2 deletion locus
+res_exp_final <- tibble(gene = colnames(exp2)[2:ncol(exp2)],
+                        corr = NA, pval = NA) %>%
+                  mutate(gene_22q = gene %in% genes_22q_df$gene)
+```
+
+```{r}
+#| label: per-gene-permutation-test-parallel
+#| output: false
+library(foreach)
+library(doParallel)
+n_cores <- 36
+# Register cluster
+
+cats = c("GM","SA", "CT")
+cohorts <- c("CHOP", "ENIGMA")
+actual_corrs <- list()
+j <- 1
+maps <- res_exp_final$gene
+for (cohort in c("CHOP", "ENIGMA")) {
+  for (cat in cats) {
+    # Define permutation matrix and data matrix
+    if (cohort == "CHOP") {
+      suf <- ""
+      if (cat != "CT") {
+        df_test <- df_chop_full
+        perm_mat <- perm_mat_chop_full
+      } else {
+        df_test <- df_chop_mpr
+        perm_mat <- perm_mat_chop_mpr
+      }
+    } else {
+      suf <- "_ENIGMA"
+      df_test <- df_enigma
+      perm_mat <- perm_mat_enigma
+    }
+    cluster <- makeCluster(n_cores)
+    registerDoParallel(cluster)
+    res <- expand_grid(measure = cat, map = maps, Source = cohort)
+    
+    results <- list()
+    start.time <- Sys.time()
+    
+    results <- foreach(i = 1:nrow(res), 
+                       .packages = c("tidyverse","glue", "DescTools",
+                                     "dtplyr","data.table","matrixTests")) %dorng% {
+        # Define brain map
+        brain_map <- res_exp %>%
+                        filter(measure == res$measure[i]) %>%
+                        select(label, !!res$map[i])
+        # Run permutation
+        perm_results <- run_gradient(df_test, brain_map, res$map[i], 
+                                 perm_mat, method = "pearson")
+        # Append results
+        results[[i]] <- list("summary" = perm_results[c("map","corr_case","corr_cont","t","p")],
+                             "actual_corrs" = list(perm_results[["actual_corrs"]] %>%
+                                                     mutate(gene = res$map[i],
+                                                            measure = res$measure[i],
+                                                            Source = res$Source[i])))
+    }
+    
+    # Curate correlations and summary
+    res <- as_tibble(list(v=results)) %>% unnest_wider(v)
+    actual_corrs[[j]] <- bind_rows(res$actual_corrs)
+    res <- bind_rows(res$summary)
+    end.time <- Sys.time()
+    time.taken <- round(end.time - start.time,2)
+    time.taken
+    stopCluster(cluster)
+    
+    write_csv(res,glue("../tables/gene_correlation_perms_ind_{cat}{suf}.csv"))
+    j <- j + 1
+  }
+
+}
+actual_corrs <- bind_rows(actual_corrs)
+```
+
+```{r}
+#| label: define-gene-set-enrichment-function
+#| output: false
+# Genome-wide gene-set enrichment test: is the 22q11.2 deletion locus gene set
+# more strongly correlated with the 22q11DS-specific brain deviation pattern
+# than expected by chance? Null = medians of random equal-sized gene sets.
+test_enrichment <- function(df, value_col = "eff_size", gene_col = "gene_22q",
+                            n_perm = 10000, seed = 2514) {
+  set.seed(seed)
+  # Get 22q test set size
+  n_22q    <- sum(df[[gene_col]])
+  all_vals <- df[[value_col]]
+  # Find NA values in enrichment variable
+  n_na <- sum(is.na(all_vals))
+  if (n_na > 0) {
+    all_vals <- all_vals[!is.na(all_vals)]
+    message(glue("Dropped {n_na} gene(s) with NA {value_col}"))
+  }
+  # Compare stats based on which enrichment variable we are using
+  if (value_col == "rank") {
+    # one-sided test that 22q genes are more aligned
+    obs_stat <- median(df[[value_col]][df[[gene_col]]])
+    null_stats <- replicate(n_perm, median(sample(all_vals, n_22q)))
+  } else {
+    # two-sided test that 22q genes are more extreme
+    obs_stat <- median(abs(df[[value_col]][df[[gene_col]]]))
+    null_stats <- replicate(n_perm, median(abs(sample(all_vals, n_22q))))
+  }
+  # Calculate permutation p-value
+  p <- (1 + sum(null_stats >= obs_stat)) / (n_perm + 1)
+  tibble(obs = obs_stat,
+       null_mean = mean(null_stats),
+       null_median = median(null_stats),
+       null_sd = sd(null_stats),
+       p = p)
+}
+```
+
+```{r}
+#| label: compute-enrichment-and-context-plots
+#| output: false
+context_plots <- list()
+perm_df <- list()
+enrich_list <- tibble()
+for (source in c("CHOP","ENIGMA")) {
+  context_plots[[source]] <- list()
+  perm_df[[source]] <- list()
+  if (source == "ENIGMA") {
+    suf <- "_ENIGMA"
+  } else {
+    suf <- ""
+  }
+  for (measure in c("GMV","SA","CT")) {
+    m <- substr(measure,1,2)
+    filename <- glue("../tables/gene_correlation_perms_ind_{m}{suf}.csv")
+    perm_df[[source]][[measure]] <- read_csv(filename, show_col_types = F) %>%
+            mutate(p.fdr = p.adjust(p, method = "fdr"),
+                   gene = res_exp_final$gene,
+                   gene_22q = res_exp_final$gene_22q,
+                   measure = measure,
+                   abs_corr = abs(corr_case),
+                   eff_size = abs(t))
+    perm_df[[source]][[measure]]$rank = 1 - data.table::frank(perm_df[[source]][[measure]],
+                                      -abs_corr, p, 
+                                      ties.method = "dense")/nrow(perm_df[[source]][[measure]])
+    
+    perm_df[[source]][[measure]] <- perm_df[[source]][[measure]] %>% arrange(-rank)
+    
+    enrich <- test_enrichment(perm_df[[source]][[measure]], 
+                              "abs_corr")
+    enrich_list <-  bind_rows(enrich_list, 
+                           enrich %>% mutate(Source = source, measure = measure))
+    
+    perm_df[[source]][[measure]]$abs_corr <- abs(perm_df[[source]][[measure]]$corr_case)
+    genes_22q   <- perm_df[[source]][[measure]] %>% filter(gene_22q)
+    genes_no22q <- perm_df[[source]][[measure]] %>% filter(!gene_22q)
+    
+    
+    context_plots[[source]][[measure]] <- ggplot(perm_df[[source]][[measure]], 
+                                                 aes(abs_corr)) +
+      geom_histogram(bins = 40, fill = "grey75", color = "white") +
+      geom_rug(data = genes_22q, aes(abs_corr), color = "firebrick", 
+               linewidth = 1, sides = "b") +
+      geom_vline(xintercept = median(genes_no22q$abs_corr), 
+                 linetype = "dashed", color = "black") +
+      geom_vline(xintercept = median(genes_22q$abs_corr), color = "firebrick", linewidth = 1) +
+      annotate("text", x = median(genes_22q$abs_corr), y = Inf, 
+               hjust = -0.05, vjust = 1.6,
+               size = annotation_pt(base_font-1), color = "firebrick", 
+               label = glue('22q genes\np = {enrich %>% pull(p) %>% signif(2)}')) +
+      theme_pubclean() +
+      xlab("Pearson's |r|\n(individual genes)") +
+      ylab("Gene Count")
+
+  }
+}
+```
+
+#### Individual Genes
+
+```{r}
+#| label: combine-chop-enigma-gene-results
+#| output: false
+source <- "CHOP"
+source <- "ENIGMA"
+perm_combined <- bind_rows(
+                    bind_rows(perm_df[["CHOP"]]) %>% mutate(source = "CHOP"),
+                    bind_rows(perm_df[["ENIGMA"]]) %>% mutate(source = "ENIGMA")
+                  )
+```
+
+```{r}
+#| label: build-22q-gene-results-table
+gene_table <- perm_combined %>%
+    filter(gene_22q) %>% 
+    select(source, measure, gene, corr_case, corr_cont, abs_corr, rank) %>%
+    mutate(measure = factor(measure, levels = c("SA","GMV","CT")),
+           corr_case = round(corr_case, 3),
+           corr_cont = round(corr_cont, 3),
+           abs_corr  = round(abs_corr, 3),
+           rank = round(rank, 2)) %>%
+    arrange(source, measure, -abs_corr)
+
+write_csv(gene_table %>% filter(source == "CHOP"), "../tables/formatted/table_s09.csv")
+write_csv(gene_table %>% filter(source == "ENIGMA"), "../tables/formatted/table_s10.csv")
+```
+
+```{r}
+#| label: build-candidate-gene-plots
+#| output: false
+c_bar <- c("grey85","purple")
+gene1 <- "AIFM3"
+gene2 <- "TXNRD2"
+genes <- c(gene1,gene2)
+map_lims <- c(floor(min(res_exp %>% select(any_of(genes)))*20)/20,
+              ceiling(max(res_exp %>% select(any_of(genes)))*20)/20)
+
+gene_plots <- list()
+for (source in c("CHOP","ENIGMA")) {
+  gene_plots[[source]] <- list()
+  for (gene_plot in genes) {
+    gene_plots[[source]][[gene_plot]] <- list()
+    brain_map <- res_exp %>% 
+                   select(label, any_of(gene_plot)) %>%
+                   filter(startsWith(label,"GM.")) %>%
+                   mutate(label = str_remove_all(label,"GM\\.|SA\\.|CT\\."))
+    
+    gene_plots[[source]][[gene_plot]][["GM"]] <- corr_plots_bar(actual_corrs %>% 
+                                          filter(Source == source, 
+                                                 gene == gene_plot, 
+                                                 measure == "GM"))
+    
+    
+    gene_plots[[source]][[gene_plot]][["SA"]] <- corr_plots_bar(actual_corrs %>% 
+                                          filter(Source == source, 
+                                                 gene == gene_plot, 
+                                                 measure == "SA"))
+    
+    
+    gene_plots[[source]][[gene_plot]][["CT"]] <- corr_plots_bar(actual_corrs %>% 
+                                          filter(Source == source, 
+                                                 gene == gene_plot, 
+                                                 measure == "CT"))
+    
+    gene_plots[[source]][[gene_plot]][["brain"]] <- plot_brain_atlas(brain_map, 
+                                             dk_plot, gene_plot, plot_lims = map_lims,
+                                             color_scheme = c_bar, lh_only = T, 
+                                             position = "other")$plot +
+  scale_fill_viridis_c()
+  }
+}
+
+```
+
+### Assemble Figures 3 and S9
+
+```{r}
+#| label: define-figure3-plot-helpers
+#| output: false
+# Formatting helpers used only to assemble the multi-panel Figure 3 / Figure S9
+# layouts below. They live here rather than in utils.R because no other script
+# uses them.
+library(ggsignif)
+library(patchwork)
+
+# Slightly smaller axis text than figure_theme, for the dense per-gene panels
+plot_theme <- theme(axis.text = element_text(size = base_font))
+
+# Adds a Wilcoxon-test significance bracket between the two diagnostic groups
+add_box_sig <- function(p, groups = c("22q11DS", "Control")) {
+  p + geom_signif(comparisons = list(groups), test = "wilcox.test",
+                  map_signif_level = TRUE, textsize = 2.4, tip_length = 0.01)
+}
+
+panel_title <- function(p, label, italic = FALSE) {
+  p + ggtitle(label) +
+    theme(plot.title = element_text(size = 8, hjust = 0.5,
+                                     face = if (italic) "italic" else "plain"))
+}
+
+# Render a standalone row-spanning title
+row_title <- function(text, italic = FALSE, bold = TRUE) {
+  if (italic & bold) {
+    ff <- "bold.italic"
+  } else if (italic) {
+    ff <- "italic"
+  } else if (bold) {
+    ff <- "bold"
+  } else {
+    ff <- "plain"
+  }
+  wrap_elements(full = grid::textGrob(
+    text,
+    gp = grid::gpar(fontsize = 9, fontface = ff,
+                    fontfamily = "Helvetica")
+  ))
+}
+
+colorbar_guide <- function(title) {
+  guide_colorbar(title,
+                 barwidth = unit(2, "cm"),
+                 barheight = unit(0.3, "cm"),
+                 title.theme = element_text(angle = 0, margin = margin(b = 4)),
+                 title.position = "top",
+                 title.hjust = 0.5)
+}
+```
+
+```{r}
+#| label: chop-figure3-prep-panels
+#| output: false
+# Define Plots
+source <- "CHOP"
+# AHBA PC Maps
+p_pc1_gm <- bar_plots[[source]][["GM"]] + plot_theme
+p_pc1_sa <- bar_plots[[source]][["SA"]] + plot_theme
+p_pc1_ct <- bar_plots[[source]][["CT"]] + plot_theme
+p_pc1_brain <- plots[[source]][["abagen"]] + theme(legend.position = "none")
+
+p_pc1_gm <- panel_title(p_pc1_gm, "GMV")
+p_pc1_sa <- panel_title(p_pc1_sa, "SA")
+p_pc1_ct <- panel_title(p_pc1_ct, "CT")
+
+# Gene 1
+p_gene1_gm <- gene_plots[[source]][[gene1]][["GM"]] + plot_theme
+p_gene1_sa <- gene_plots[[source]][[gene1]][["SA"]] + plot_theme
+p_gene1_ct <- gene_plots[[source]][[gene1]][["CT"]] + plot_theme
+
+# Gene 2
+p_gene2_gm <- gene_plots[[source]][[gene2]][["GM"]] + plot_theme
+p_gene2_sa <- gene_plots[[source]][[gene2]][["SA"]] + plot_theme
+p_gene2_ct <- gene_plots[[source]][[gene2]][["CT"]] + plot_theme
+
+# Histogram
+p_context_gm <- context_plots[[source]][["GMV"]] + plot_theme
+p_context_sa <- context_plots[[source]][["SA"]] + plot_theme
+p_context_ct <- context_plots[[source]][["CT"]] + plot_theme
+```
+
+```{r}
+#| label: chop-figure3-assemble-layout
+#| output: false
+legend_pc1_brain <- get_legend(
+                      plots[[source]][["abagen"]] +
+                        guides(fill = colorbar_guide("AHBA PC1")) +
+                        figure_theme +
+                        theme(legend.position = "bottom")
+                    )
+
+legend_gene1_brain <- get_legend(gene_plots[[source]][[gene1]][["brain"]] +
+  guides(fill = guide_colorbar("AHBA Gene\nExpression",
+                               barwidth = unit(2, "cm"), barheight = unit(0.3, "cm"),
+                               title.theme = element_text(angle = 0, margin = margin(b = 4)),
+                               title.position = "top", title.hjust = 0.5),
+         color = "none") +
+  figure_theme + theme(legend.position = "bottom"))
+
+# Integrate the AHBA PC1 colorbar directly into the PC1 brain map
+p_pc1_brain <- p_pc1_brain +
+  # ggtitle("AHBA PC1") +
+  guides(fill = guide_colorbar("AHBA PC1",
+                               barwidth = unit(2, "cm"), barheight = unit(0.3, "cm"),
+                               title.theme = element_text(angle = 0, margin = margin(b = 4)),
+                               title.position = "bottom", title.hjust = 0.5)) +
+  figure_theme +
+  theme(legend.position = "bottom",
+        plot.title = element_text(size = 8, hjust = 0.5),
+        legend.box.margin = margin(t = -50),
+        plot.margin = margin(t = -80))
+        #legend.margin = margin(0, 0, 0, 0))
+
+# Metric box charts: title + tag + significance/effect size
+p_pc1_gm <- add_box_sig(p_pc1_gm + ggtitle("GMV") + labs(tag = "A") +
+                          theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+p_pc1_sa <- add_box_sig(p_pc1_sa + ggtitle("SA")  + 
+                          theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+p_pc1_ct <- add_box_sig(p_pc1_ct + ggtitle("CT")  + 
+                          theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+
+
+x <- perm_df[[source]][["GMV"]] %>% filter(map == gene1) %>% select(t, p.fdr, rank)
+p_gene1_gm <- add_box_sig(p_gene1_gm + 
+                            ggtitle(glue("GMV ({scales::percent(round(x$rank,3),accuracy = 0.1)}ile)",)) +
+                            theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+x <- perm_df[[source]][["SA"]] %>% filter(map == gene1) %>% select(t, p.fdr, rank)
+p_gene1_sa <- add_box_sig(p_gene1_sa + ggtitle("SA")  + 
+                            ggtitle(glue("SA ({scales::percent(round(x$rank,3),accuracy = 0.1)}ile)",)) +
+                            theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+x <- perm_df[[source]][["CT"]] %>% filter(map == gene1) %>% select(t, p.fdr, rank)
+p_gene1_ct <- add_box_sig(p_gene1_ct + ggtitle("CT")  + 
+                            ggtitle(glue("CT ({scales::percent(round(x$rank,3),accuracy = 0.1)}ile)",)) +
+                            theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+x <- perm_df[[source]][["GMV"]] %>% filter(map == gene2) %>% select(t, p.fdr, rank)
+p_gene2_gm <- add_box_sig(p_gene2_gm + ggtitle("GMV") + 
+                            ggtitle(glue("GMV ({scales::percent(round(x$rank,3),accuracy = 0.1)}ile)",)) +
+                            theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+x <- perm_df[[source]][["SA"]] %>% filter(map == gene2) %>% select(t, p.fdr, rank)
+p_gene2_sa <- add_box_sig(p_gene2_sa + ggtitle("SA")  + 
+                            ggtitle(glue("SA ({scales::percent(round(x$rank,3),accuracy = 0.1)}ile)",)) +
+                            theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+x <- perm_df[[source]][["CT"]] %>% filter(map == gene2) %>% select(t, p.fdr, rank)
+p_gene2_ct <- add_box_sig(p_gene2_ct + ggtitle("CT")  + 
+                            ggtitle(glue("CT ({scales::percent(round(x$rank,3),accuracy = 0.1)}ile)",)) +
+                            theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+
+# Compose the two-row gene stacks
+t1 <- row_title(bquote(italic(.(gene1)) ~ "Expression"), bold = F) + 
+                labs(tag = "C") + figure_theme
+t2 <- row_title(bquote(italic(.(gene2)) ~ "Expression"), bold = F) + figure_theme
+blank_title <- row_title(" ")
+p_gene_gm <- t1  / p_gene1_gm /
+             t2 / p_gene2_gm +
+              plot_layout(heights = c(0.1, 1, 0.1, 1)) & 
+             figure_theme
+p_gene_sa <- blank_title / 
+                    p_gene1_sa /
+              blank_title / 
+              p_gene2_sa +
+              plot_layout(heights = c(0.1, 1, 0.1, 1)) & 
+             figure_theme
+p_gene_ct <- blank_title / 
+                 p_gene1_ct /
+                 blank_title / 
+                 p_gene2_ct +
+                 plot_layout(heights = c(0.1, 1, 0.1, 1)) & 
+                 figure_theme
+
+# Gene-expression brain maps
+p_gene1_brain <- gene_plots[[source]][[gene1]][["brain"]] + 
+                      ggtitle(bquote(italic(.(gene1)))) +
+  theme(plot.title = element_text(size = 7, hjust = 0.5))
+p_gene2_brain <- gene_plots[[source]][[gene2]][["brain"]] + 
+                      ggtitle(bquote(italic(.(gene2)))) +
+  theme(plot.title = element_text(size = 7, hjust = 0.5))
+p_brain <- plot_spacer() / 
+           p_gene1_brain /
+           p_gene2_brain /
+           legend_gene1_brain /
+           plot_spacer() +
+  plot_layout(heights = c(1, 2, 2, 1.5, 1)) & figure_theme
+
+# Gene set histogram
+p_context_gm <- p_context_gm + ggtitle("GMV Correlation") + labs(tag = "B")
+p_context_sa <- p_context_sa + ggtitle("SA Correlation")
+p_context_ct <- p_context_ct + ggtitle("CT Correlation")
+
+# Combine plots
+w4 <- c(1, 1, 1, 1.1)
+
+row_pc1 <- (p_pc1_gm | p_pc1_sa | p_pc1_ct | p_pc1_brain) + 
+                plot_layout(widths = w4)
+row_ctx <- (p_context_gm | p_context_sa | p_context_ct) + 
+                plot_layout(widths = c(1,1,1))
+row_gen <- (p_gene_gm | p_gene_sa | p_gene_ct | p_brain) + 
+                plot_layout(widths = w4)
+
+combined <- (
+  row_title("AHBA Gene Expression PC1 Correlation") /
+  row_pc1 /
+  row_title("Individual Gene Expression Correlation", italic = FALSE) /
+  row_ctx /
+  row_gen
+) +
+  plot_layout(heights = c(0.15, 1, 0.15, 0.8, 2.2)) &
+  figure_theme
+```
+
+```{r, fig.height = 8, fig.width = 6.69}
+#| label: chop-figure3-save
+#| echo: false
+#| fig-cap: "Figure 3. Correlation of individual 22q11DS brain deviation maps with Allen Human Brain Atlas gene expression: AHBA PC1 correlations, genome-wide correlation distributions with 22q11.2-locus genes highlighted, and AIFM3 and TXNRD2 expression maps (CHOP cohort)."
+combined
+ggsave("../figures_final/png/figure_3_gene_expression.png")
+ggsave("../figures_final/pdf/figure_3_gene_expression.pdf")
+```
+
+```{r}
+#| label: enigma-figures9-prep-panels
+#| output: false
+# Define Plots
+source <- "ENIGMA"
+# AHBA PC Maps
+p_pc1_gm <- bar_plots[[source]][["GM"]] + plot_theme
+p_pc1_sa <- bar_plots[[source]][["SA"]] + plot_theme
+p_pc1_ct <- bar_plots[[source]][["CT"]] + plot_theme
+p_pc1_brain <- plots[[source]][["abagen"]] + theme(legend.position = "none")
+
+p_pc1_gm <- panel_title(p_pc1_gm, "GMV")
+p_pc1_sa <- panel_title(p_pc1_sa, "SA")
+p_pc1_ct <- panel_title(p_pc1_ct, "CT")
+
+# Gene 1
+p_gene1_gm <- gene_plots[[source]][[gene1]][["GM"]] + plot_theme
+p_gene1_sa <- gene_plots[[source]][[gene1]][["SA"]] + plot_theme
+p_gene1_ct <- gene_plots[[source]][[gene1]][["CT"]] + plot_theme
+
+# Gene 2
+p_gene2_gm <- gene_plots[[source]][[gene2]][["GM"]] + plot_theme
+p_gene2_sa <- gene_plots[[source]][[gene2]][["SA"]] + plot_theme
+p_gene2_ct <- gene_plots[[source]][[gene2]][["CT"]] + plot_theme
+
+# Histogram
+p_context_gm <- context_plots[[source]][["GMV"]] + plot_theme
+p_context_sa <- context_plots[[source]][["SA"]] + plot_theme
+p_context_ct <- context_plots[[source]][["CT"]] + plot_theme
+```
+
+```{r}
+#| label: enigma-figures9-assemble-layout
+#| output: false
+legend_pc1_brain <- get_legend(
+                      plots[[source]][["abagen"]] +
+                        guides(fill = colorbar_guide("AHBA PC1")) +
+                        figure_theme +
+                        theme(legend.position = "bottom")
+                    )
+
+legend_gene1_brain <- get_legend(gene_plots[[source]][[gene1]][["brain"]] +
+  guides(fill = guide_colorbar("AHBA Gene\nExpression",
+                               barwidth = unit(2, "cm"), barheight = unit(0.3, "cm"),
+                               title.theme = element_text(angle = 0, margin = margin(b = 4)),
+                               title.position = "top", title.hjust = 0.5),
+         color = "none") +
+  figure_theme + theme(legend.position = "bottom"))
+
+p_pc1_brain <- p_pc1_brain +
+  # ggtitle("AHBA PC1") +
+  guides(fill = guide_colorbar("AHBA PC1",
+                               barwidth = unit(2, "cm"), barheight = unit(0.3, "cm"),
+                               title.theme = element_text(angle = 0, margin = margin(b = 4)),
+                               title.position = "bottom", title.hjust = 0.5)) +
+  figure_theme +
+  theme(legend.position = "bottom",
+        plot.title = element_text(size = 8, hjust = 0.5),
+        legend.box.margin = margin(t = -50),
+        plot.margin = margin(t = -80))
+        #legend.margin = margin(0, 0, 0, 0))
+
+# Metric box charts: title + tag + significance/effect size
+p_pc1_gm <- add_box_sig(p_pc1_gm + ggtitle("GMV") + labs(tag = "A") +
+                          theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+p_pc1_sa <- add_box_sig(p_pc1_sa + ggtitle("SA")  + 
+                          theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+p_pc1_ct <- add_box_sig(p_pc1_ct + ggtitle("CT")  + 
+                          theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+
+
+x <- perm_df[[source]][["GMV"]] %>% filter(map == gene1) %>% select(t, p.fdr, rank)
+p_gene1_gm <- add_box_sig(p_gene1_gm + 
+                            ggtitle(glue("GMV ({scales::percent(round(x$rank,3),accuracy = 0.1)}ile)",)) +
+                            theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+x <- perm_df[[source]][["SA"]] %>% filter(map == gene1) %>% select(t, p.fdr, rank)
+p_gene1_sa <- add_box_sig(p_gene1_sa + ggtitle("SA")  + 
+                            ggtitle(glue("SA ({scales::percent(round(x$rank,3),accuracy = 0.1)}ile)",)) +
+                            theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+x <- perm_df[[source]][["CT"]] %>% filter(map == gene1) %>% select(t, p.fdr, rank)
+p_gene1_ct <- add_box_sig(p_gene1_ct + ggtitle("CT")  + 
+                            ggtitle(glue("CT ({scales::percent(round(x$rank,3),accuracy = 0.1)}ile)",)) +
+                            theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+x <- perm_df[[source]][["GMV"]] %>% filter(map == gene2) %>% select(t, p.fdr, rank)
+p_gene2_gm <- add_box_sig(p_gene2_gm + ggtitle("GMV") + 
+                            ggtitle(glue("GMV ({scales::percent(round(x$rank,3),accuracy = 0.1)}ile)",)) +
+                            theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+x <- perm_df[[source]][["SA"]] %>% filter(map == gene2) %>% select(t, p.fdr, rank)
+p_gene2_sa <- add_box_sig(p_gene2_sa + ggtitle("SA")  + 
+                            ggtitle(glue("SA ({scales::percent(round(x$rank,3),accuracy = 0.1)}ile)",)) +
+                            theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+x <- perm_df[[source]][["CT"]] %>% filter(map == gene2) %>% select(t, p.fdr, rank)
+p_gene2_ct <- add_box_sig(p_gene2_ct + ggtitle("CT")  + 
+                            ggtitle(glue("CT ({scales::percent(round(x$rank,3),accuracy = 0.1)}ile)",)) +
+                            theme(plot.title = element_text(size = 8, hjust = 0.5))) + 
+                            scale_y_continuous(expand = expansion(mult = c(0.05, 0.15)))
+
+# Compose the two-row gene stacks
+t1 <- row_title(bquote(italic(.(gene1)) ~ "Expression"), bold = F) + 
+                labs(tag = "C") + figure_theme
+t2 <- row_title(bquote(italic(.(gene2)) ~ "Expression"), bold = F) + figure_theme
+blank_title <- row_title(" ")
+p_gene_gm <- t1  / p_gene1_gm /
+             t2 / p_gene2_gm +
+              plot_layout(heights = c(0.1, 1, 0.1, 1)) & 
+             figure_theme
+p_gene_sa <- blank_title / 
+                    p_gene1_sa /
+              blank_title / 
+              p_gene2_sa +
+              plot_layout(heights = c(0.1, 1, 0.1, 1)) & 
+             figure_theme
+p_gene_ct <- blank_title / 
+                 p_gene1_ct /
+                 blank_title / 
+                 p_gene2_ct +
+                 plot_layout(heights = c(0.1, 1, 0.1, 1)) &
+                 figure_theme
+
+# Gene-expression brain maps
+p_gene1_brain <- gene_plots[[source]][[gene1]][["brain"]] + 
+                      ggtitle(bquote(italic(.(gene1)))) +
+  theme(plot.title = element_text(size = 7, hjust = 0.5))
+p_gene2_brain <- gene_plots[[source]][[gene2]][["brain"]] + 
+                      ggtitle(bquote(italic(.(gene2)))) +
+  theme(plot.title = element_text(size = 7, hjust = 0.5))
+p_brain <- plot_spacer() / 
+           p_gene1_brain /
+           p_gene2_brain /
+           legend_gene1_brain /
+           plot_spacer() +
+  plot_layout(heights = c(1, 2, 2, 1.5, 1)) & figure_theme
+
+# Gene set histograms
+p_context_gm <- p_context_gm + ggtitle("GMV Correlation") + labs(tag = "B")
+p_context_sa <- p_context_sa + ggtitle("SA Correlation")
+p_context_ct <- p_context_ct + ggtitle("CT Correlation")
+
+# Combine maps
+w4 <- c(1, 1, 1, 1.1)   # brain column vs three metric columns; tune brain width
+
+row_pc1 <- (p_pc1_gm | p_pc1_sa | p_pc1_ct | p_pc1_brain) + 
+                plot_layout(widths = w4)
+row_ctx <- (p_context_gm | p_context_sa | p_context_ct) + 
+                plot_layout(widths = c(1,1,1))
+row_gen <- (p_gene_gm | p_gene_sa | p_gene_ct | p_brain) + 
+                plot_layout(widths = w4)
+
+combined <- (
+  row_title("AHBA Gene Expression PC1 Correlation") /
+  row_pc1 /
+  row_title("Individual Gene Expression Correlation", italic = FALSE) /
+  row_ctx /
+  row_gen
+) +
+  plot_layout(heights = c(0.15, 1, 0.15, 0.8, 2.2)) &
+  figure_theme
+```
+
+```{r, fig.height = 8, fig.width = 6.69}
+#| label: enigma-figures9-save
+#| echo: false
+#| fig-cap: "Figure S9. Replication in the ENIGMA cohort of the AHBA gene expression correlations shown in Figure 3."
+combined
+ggsave("../figures_final/png/figure_s9_gene_expression_enigma.png")
+ggsave("../figures_final/pdf/figure_s9_gene_expression_enigma.pdf")
+```
+
+## Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

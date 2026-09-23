@@ -1,0 +1,762 @@
+---
+title: "ENIGMA-22q Normative Centile Generation"
+author: "Benjamin Jung, PhD"
+format:
+  pdf:
+    documentclass: scrreprt
+    toc: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r}
+#| label: setup-environment
+#| output: false
+rm(list=ls())
+library(tidyverse)
+library(glue)
+library(freesurfer)
+library(ggseg)
+# Loads Calc.Novel(): applies a pre-fit LBCC GAMLSS model to new ("novel") data
+# out-of-sample
+source('../Lifespan/940.calc-novel-wo-subset-function.r')
+```
+
+## Load Pre-Fit LBCC Models
+
+```{r}
+#| label: compile-lbcc-feature-lists
+#| output: false
+# Read in global model features
+features.glob <- basename(Sys.glob("../../../../braincharts/LBCC/global/RDS/*Transformed"))
+features.glob <- str_replace_all(features.glob,"globalv1-","")
+features.glob <- str_replace_all(features.glob,"Transformed","")
+
+# Read in SA model features
+features.sa <- basename(Sys.glob("../../../../braincharts/LBCC/test-SA-site-merge-v2/RDS/*.SA.*"))
+features.sa <- str_replace_all(features.sa,"site240920-","")
+features.sa <- str_replace_all(features.sa,"Transformed","")
+
+# Read in CT model features
+features.ct <- basename(Sys.glob("../../../../braincharts/LBCC/test-CT-site-merge-v5/RDS/*.CT.*"))
+features.ct <- str_replace_all(features.ct,"site240920-","")
+features.ct <- str_replace_all(features.ct,"Transformed","")
+
+# Read in GM model features
+features.gm <- basename(Sys.glob("../../../../braincharts/LBCC/test-GM-site-merge-v3/RDS/*.GM.*"))
+features.gm <- str_replace_all(features.gm,"site240920-","")
+features.gm <- str_replace_all(features.gm,"Transformed","")
+
+# Read in subcort GM model features
+features.subc <- basename(dirname(Sys.glob("../../../../braincharts/LBCC/test-SUBC-site-merge-v2/RDS/*SUBC.*/FIT.EXTRACT.rds")))
+features.subc <- str_replace_all(features.subc,"site240920-","")
+features.subc <- str_replace_all(features.subc,"Transformed","")
+
+features <- c(features.subc, features.glob,features.gm, features.ct, features.sa)
+
+```
+
+```{r}
+#| label: exclude-invalid-subc-features
+#| output: false
+features <- features[!(features %in% c("SUBC.Left.choroid.plexus", "SUBC.Right.choroid.plexus","SUBC.CSF","SUBC.5th.Ventricle","SUBC.Optic.Chiasm"))]
+```
+
+## Freesurfer Volume Processing (R)
+
+### Compile Output
+
+```{r}
+#| label: set-freesurfer-dir
+#| output: false
+# Specify directory w/ FS outputs
+fs_dir <- "../../../../Data/misc_research/22q-ENIGMA/subjects"
+```
+
+```{r}
+#| label: process-aparc-cortical-stats
+#| output: false
+# Read in LH cortical structures
+lh.aparc.stats <- read_atlas_files(fs_dir, "lh.aparc.stats")
+lh.aparc.stats$prefix <- "lh"
+# Read in RH cortical structures
+rh.aparc.stats <- read_atlas_files(fs_dir, "rh.aparc.stats")
+rh.aparc.stats$prefix <- "rh"
+
+# Filter unused cortical features
+exclude_features <- c("NumVert", "ThickStd","GausCurv","FoldInd","CurvInd","MeanCurv")
+
+# Concatenate cortical features
+aparc.stats <- bind_rows(lh.aparc.stats,rh.aparc.stats)
+aparc.stats <- aparc.stats[,!(colnames(aparc.stats) %in% exclude_features)]
+
+# Wide to long
+aparc.stats <- gather(aparc.stats, measure, value, SurfArea:ThickAvg, factor_key=TRUE)
+
+# Preliminary relabeling
+aparc.stats <- aparc.stats %>%
+                    mutate(merge_label = glue("{prefix}.{measure}_{label}")) %>%
+                    mutate(merge_label = str_replace_all(merge_label,
+                                                         c('SurfArea_' = "SA.",
+                                                            'ThickAvg_' = "CT.",
+                                                            'GrayVol_' = "GM.",
+                                                            'lh_' = "",
+                                                            'rh_' = "")))
+
+
+aparc.stats <- aparc.stats[,!(colnames(aparc.stats) %in% c("prefix"))]
+```
+
+```{r}
+#| label: process-aseg-subcortical-stats
+#| output: false
+# Read in SUBCortical structures
+aseg.stats <- read_atlas_files(fs_dir, "aseg.stats")
+
+# Filter SUBCortical structures
+aseg.stats <- aseg.stats %>%
+                filter(!grepl("-vessel",label)) %>%
+                filter(!grepl("hypointensities",label))
+
+exclude_features <- c("NVoxels", "Index","SegId","FoldInd","normMean","normStdDev","normMin","normRange","normMax")
+aseg.stats <- aseg.stats[,!(colnames(aseg.stats) %in% exclude_features)]
+# Rename columns for consistency
+colnames(aseg.stats) <- c("subject","Vol","label")
+
+# Convert wide to long
+aseg.stats <- gather(aseg.stats, measure, value, Vol, factor_key=TRUE)
+
+# Preliminary relabeling
+aseg.stats <- aseg.stats %>%
+                    mutate(merge_label = glue("SUBC.{label}")) %>%
+                    mutate(merge_label = str_replace_all(merge_label,
+                                                        c('-' = '.',
+                                                          "\\.inf\\." = ".inferior.",
+                                                          "\\.lat\\." = ".lateral.",
+                                                          "\\.vent$" = ".ventricle")))
+```
+
+```{r}
+#| label: compute-global-stats-per-subject
+#| output: false
+#Loop through each subject to read global measures
+fs_sub_paths <- Sys.glob(glue("{fs_dir}/*"))
+for (fs_sub_path in fs_sub_paths) {
+    sub = basename(fs_sub_path)
+
+    # Load in global features (aseg)
+    file <- glue("{fs_sub_path}/aseg.stats")
+    exclude_measures <- c("brainsegnotventsurf","mask",
+                          "surfaceholes","maskvol-to-etiv",
+                          "brainsegvol-to-etiv")
+    if (file.exists(file)) {
+      global.stats.ind <- read_aseg_stats(file)$measures %>%
+                      add_column(subject = sub, .before = "measure") %>%
+                      filter(!(measure %in% exclude_measures))
+    }
+    # Load in global features (lh)
+    file <- glue("{fs_sub_path}/lh.aparc.stats")
+    if (file.exists(file)) {
+      lh_stats <- read_aseg_stats(file)
+      lh_sa <- sum(lh_stats$structures$SurfArea)
+      global.stats.ind <- bind_rows(global.stats.ind,lh_stats$measures %>%
+                      add_column(subject = sub, .before = "measure") %>%
+                      filter(!(measure_long %in% c("numvert"))) %>%
+                      mutate(measure_long = str_replace_all(measure_long,
+                                              c("whitesurfarea" = "lhwhitesurfacearea",
+                                                "meanthickness" = "lhmeanthickness"))))
+    }
+
+
+    # Load in global features (rh)
+    file <- glue("{fs_sub_path}/rh.aparc.stats")
+    if (file.exists(file)) {
+      rh_stats <- read_aseg_stats(file)
+      rh_sa <- sum(rh_stats$structures$SurfArea)
+      global.stats.ind <- bind_rows(global.stats.ind,rh_stats$measures %>%
+                      add_column(subject = sub, .before = "measure") %>%
+                      filter(!(measure_long %in% c("numvert"))) %>%
+                      mutate(measure_long = str_replace_all(measure_long,
+                                              c("whitesurfarea" = "rhwhitesurfacearea",
+                                                "meanthickness" = "rhmeanthickness"))))
+    }
+    global.stats.ind <- global.stats.ind %>%
+                          mutate(value = as.numeric(value)) %>%
+                          add_row(subject = sub,
+                                  measure = "SA",
+                                  measure_long = "totalsurfarea",
+                                  meaning = "total surface area",
+                                  value = lh_sa + rh_sa,
+                                  units = "mm^2")
+
+    # Store global stats
+    if (fs_sub_path == fs_sub_paths[1]) {
+        global.stats <- global.stats.ind
+    } else {
+        global.stats <- bind_rows(global.stats,global.stats.ind)
+    }
+}
+
+global.stats <- tibble(global.stats)
+
+# Remove extraneous columns
+global.stats <- global.stats[!(colnames(global.stats) %in% c("measure","meaning","units"))]
+#Relabel for consistency
+colnames(global.stats) <- c("subject","label","Vol")
+# Wide to long
+global.stats <- gather(global.stats, measure, value, Vol, factor_key=TRUE)
+
+# Preliminary relabeling
+global.stats <- global.stats %>%
+                    mutate(merge_label = glue("GLOB.{tolower(label)}")) %>%
+                    mutate(merge_label = str_replace_all(merge_label,
+                                                      c("\\.lh" = ".left.",
+                                                        "\\.rh" = ".right.")))
+```
+
+```{r}
+#| label: compute-euler-number
+#| output: false
+euler.stats <- global.stats %>%
+                filter(grepl("surfacehole",label)) %>%
+                mutate(euler = 2-2*as.numeric(value)) %>%
+                group_by(subject) %>%
+                summarize(euler = mean(euler))
+```
+
+```{r}
+#| label: combine-regional-and-global-measures
+#| output: false
+#Concatenate regional measures
+region.stats <- bind_rows(aparc.stats,aseg.stats)
+#Concatenate global measures
+region.stats$value <- as.double(region.stats$value)
+global.stats$value <- as.double(global.stats$value)
+mri.measures <- bind_rows(region.stats,global.stats)
+mri.measures <- mri.measures[,!(colnames(mri.measures) %in% c("label","measure"))]
+
+mri.measures <- mri.measures[!duplicated(mri.measures),]
+```
+
+### Reformat Structure Names
+
+```{r}
+#| label: rename-global-structure-labels
+#| output: false
+mri.measures <- mri.measures %>%
+                  mutate(merge_label = replace(merge_label,
+                                               merge_label == "GLOB.etiv",
+                                               "eTIV"),
+                         merge_label = replace(merge_label,
+                                               merge_label == "GLOB.totalsurfarea",
+                                               "SA"))
+```
+
+```{r}
+#| label: compute-composite-regions
+#| output: false
+# Convert from long to wide
+mri.measures.wide <- spread(mri.measures, merge_label, value)
+
+# Compute composite regions
+# ventricles.all
+mri.measures.wide$Ventricles.all <- mri.measures.wide$SUBC.Left.Lateral.Ventricle +
+                                    mri.measures.wide$SUBC.Left.Inf.Lat.Vent +
+                                    mri.measures.wide$SUBC.Right.Lateral.Ventricle +
+                                    mri.measures.wide$SUBC.Right.Inf.Lat.Vent +
+                                    mri.measures.wide$SUBC.3rd.Ventricle +
+                                    mri.measures.wide$SUBC.4th.Ventricle
+
+# ventricles.lateral
+mri.measures.wide$Ventricles.lateral <- mri.measures.wide$SUBC.Left.Lateral.Ventricle +
+                                        mri.measures.wide$SUBC.Right.Lateral.Ventricle
+
+# Thalamus
+mri.measures.wide$Thalamus <- mri.measures.wide$SUBC.Left.Thalamus.Proper +
+                              mri.measures.wide$SUBC.Right.Thalamus.Proper
+
+# cerebellum
+mri.measures.wide$Cerebellum.GM <- mri.measures.wide$SUBC.Left.Cerebellum.Cortex +
+                                   mri.measures.wide$SUBC.Right.Cerebellum.Cortex
+
+mri.measures.wide$Cerebellum.WM <- mri.measures.wide$SUBC.Left.Cerebellum.White.Matter +
+                                   mri.measures.wide$SUBC.Right.Cerebellum.White.Matter
+
+mri.measures.wide$Cerebellum.all <- mri.measures.wide$Cerebellum.GM +
+                                    mri.measures.wide$Cerebellum.WM
+
+# CT
+mri.measures.wide$CT <- mri.measures.wide %>%
+                            select(GLOB.left.meanthickness,GLOB.right.meanthickness) %>%
+                            rowMeans()
+```
+
+## Meta and Demographic Data Processing
+
+### Import manifest file
+
+```{r}
+#| label: load-manifest-file
+#| output: false
+# Specify path of pre-existing manifest
+manifest_file <- "../data/ENIGMA/ENIGMA_22q_data.csv"
+ 
+# Load pre-existing manifest
+manifest_df <- read_csv(manifest_file, show_col_types = FALSE)
+ 
+qc_cols <- c("general white matter", "general grey matter", "general csf", "cerebellum",
+             "brainstem", "thalamus", "putamen+pallidum", "hippocampus+amygdala")
+```
+
+### Get resolution and QC info
+
+```{r}
+#| label: compute-qc-metrics
+#| output: false
+
+manifest_df$qc_path <- NA
+manifest_df[qc_cols] <- NA
+ 
+for (i in 1:nrow(manifest_df)) {
+  # Get scan path and qc for each subject
+  subj_id <- manifest_df$SubjID[i]
+  scan_matches <- Sys.glob(file.path(fs_dir, subj_id, "mri", "orig", "*.mgz"))
+ 
+  if (length(scan_matches) == 1) {
+    qc_matches <- Sys.glob(file.path(fs_dir, subj_id, "T1_ss_qc.csv"))
+ 
+    if (length(qc_matches) == 1) {
+      manifest_df$qc_path[i] <- qc_matches[1]
+      qc_df <- read_csv(qc_matches[1], n_max = 1, show_col_types = FALSE)
+      manifest_df[i, qc_cols] <- qc_df[1, qc_cols]
+    }
+  }
+}
+ 
+# Flag QC status: TRUE if all metrics > 0.65, FALSE if any metric is <= 0.65
+# or missing, NA if every metric is missing
+manifest_df <- manifest_df %>%
+  rowwise() %>%
+  mutate(QC = {vals <- c_across(all_of(qc_cols))
+                if (all(is.na(vals))) {
+                  NA
+                } else {
+                  all(replace(vals, is.na(vals), -Inf) > 0.65)
+                }
+              }) %>%
+  ungroup()
+```
+
+### create participant, session, site, dx, age_days, mean_qc columns
+
+```{r}
+#| label: create-demographic-columns
+#| output: false
+# Rename columns, derive age/session, and recode diagnosis
+manifest_df <- manifest_df %>%
+  rename(participant = SubjID,
+          site        = Site,
+          dx          = DxName,
+          sex         = SexName) %>%
+  mutate(age_days = Age * 365.25 + 280) %>%
+  group_by(participant) %>%
+  mutate(session = paste0("ses-", dense_rank(age_days))) %>%
+  ungroup() %>%
+  mutate(
+    magnetic_strength = NA,
+    mean_qc = rowMeans(across(all_of(qc_cols)), na.rm = TRUE),
+    dx = if_else(dx == "HC", "CN", dx)
+  )
+```
+
+### Merge manifest with morphometrics
+
+```{r}
+#| label: merge-manifest-with-morphometrics
+#| output: false
+# Merge in imaging measures and drop redundant columns
+# (assumes `mri.measures.wide` is already an R data frame in your environment,
+# replacing the reticulate `r["mri.measures.wide"]` reference)
+df <- manifest_df %>%
+  left_join(mri.measures.wide, by = c("participant" = "subject")) %>%
+  select(-any_of(c("Frank_MergeID", "Dx", "Sex", "subject")))
+```
+
+### Save df
+
+```{r}
+#| label: save-enigma-volumes-csv
+#| output: false
+# Save output
+dir.create("../data/ENIGMA/")
+write_csv(df, "../data/ENIGMA/ENIGMA_volumes.csv")
+```
+
+## Predict Centiles (R)
+
+### Load Data
+
+```{r}
+#| label: load-and-rename-global-columns
+#| output: false
+df = read.csv("../data/ENIGMA/ENIGMA_volumes.csv")
+# Rename global structures
+glob.measures <- grepl("GLOB.",colnames(df))
+colnames(df)[glob.measures] <- colnames(df)[glob.measures] %>%
+                                          str_replace_all("cerebellum","Cerebellum") %>%
+                                          str_replace_all("ventricles","Ventricles") %>%
+                                          str_replace_all("thalamus","Thalamus") %>%
+                                          str_replace_all("brainstem","Brainstem") %>%
+                                          str_replace_all("gm","GM") %>%
+                                          str_replace_all("wm","WM") %>%
+                                          str_replace_all("GLOB.","")
+```
+
+```{r}
+#| label: prepare-covariates-and-save-raw
+#| output: false
+# Add hard-coded variables
+df$sex = factor(df$sex,levels=c('Female','Male'),labels=c('Female',"Male"))
+df$fs_version = 'FS53'
+df$AgeTransformed=log(df$age_days)
+df$study <- toupper(df$Mega_Scanner_Name)
+df$study[is.na(df$study)] <- toupper(df$site[is.na(df$study)])
+df$site <- df$study
+
+df <- df %>%
+            select(-c(general.white.matter, general.grey.matter, general.csf,
+                      cerebellum, brainstem, thalamus, putamen.pallidum,
+                      hippocampus.amygdala)) %>%
+            filter(dx %in% c("CN","22q11DS")) %>%
+            mutate(dx = factor(dx, levels = c("CN","22q11DS")),
+                   study_site = study)
+
+```
+
+### Predict Centiles
+
+```{r}
+#| label: apply-lbcc-models-to-regions
+#| output: false
+# For each region, load the corresponding pre-fit LBCC GAMLSS model (feature
+# set determined by which features.* list the region belongs to) and apply it
+# out-of-sample via Calc.Novel to obtain centile scores (*.q.wre) and
+# normalised deviation scores (*.normalised) for the ENIGMA-22q subjects.
+event_list <- list()
+MODELS <- list()
+
+exclude_list <- c("SUBC.Left.Cerebellum.White.Matter",
+                  "SUBC.Right.Cerebellum.White.Matter",
+                  "Brainstem","SUBC.Left.vessel","SUBC.Right.vessel",
+                  "SUBC.non.WM.hypointensities","SUBC.WM.hypointensities",
+                  "SUBC.CC_Anterior", "SUBC.CC_Central",
+                  "SUBC.CC_Mid_Anterior","SUBC.CC_Mid_Posterior",
+                  "SUBC.CC_Posterior","Thalamus","SUBC.5th_Ventricle",
+                  "Ventricles.lateral","Cerebellum.GM","Cerebellum.WM",
+                  "Ventricles.lateral")
+
+retain_cols <- c("participant", "age_days", "sex",'dx.original','site',
+                 "Psychotic_Disorder", "Standard_Handedness", "Within_Group_Scanner",
+                 "Mega_Scanner", "Deletion_Type", "IQ", "IQ_Method", "Psychotic_Disorder_Name",
+                 "Current_Typical_Antipsychotic", "Current_Li", "Current_AntiConvulsant",
+                 "Current_AntiDep", "Current_Psychostimulant", "Current_Other_Med")
+#Subset to event
+NewData <- df[df$session == "ses-1" & !(df$study %in% c("UTRECHT", "TORONTO2")),]
+region_list <- list()
+norm_list <- list()
+for(region in features) {
+  if (region %in% exclude_list) {
+    next
+  } else if (region %in% features.glob) {
+    rds_dir <- "../../../../braincharts/LBCC/global/RDS/globalv1-"
+    fit_file <- paste0(rds_dir, region, "Transformed/FIT.EXTRACT.rds")
+    derived_file <- paste0(rds_dir, region, "Transformed/DERIVED.without.boot.rds")
+    NewData$fs_version <- "FS5.3"
+  } else if (region %in% features.subc) {
+    rds_dir <- "../../../../braincharts/LBCC/test-SUBC-site-merge-v2/RDS/site240920-"
+    fit_file <- paste0(rds_dir, region, "Transformed/FIT.EXTRACT.rds")
+    derived_file <- paste0(rds_dir, region, "Transformed/DERIVED.without.boot.v2.rds")
+    NewData$fs_version <- "FS5.3"
+  } else if (region %in% features.gm) {
+    rds_dir <- "../../../../braincharts/LBCC/test-GM-site-merge-v3/RDS/site240920-"
+    fit_file <- paste0(rds_dir, region, "Transformed/FIT.EXTRACT.rds")
+    derived_file <- paste0(rds_dir, region, "Transformed/DERIVED.without.boot.v2.rds")
+    NewData$fs_version <- "FS5.3"
+  } else if (region %in% features.ct) {
+    rds_dir <- "../../../../braincharts/LBCC/test-CT-site-merge-v5/RDS/site240920-"
+    fit_file <- paste0(rds_dir, region, "Transformed/FIT.EXTRACT.rds")
+    derived_file <- paste0(rds_dir, region, "Transformed/DERIVED.without.boot.v2.rds")
+    NewData$fs_version <- "FS5.3"
+  } else if (region %in% features.sa) {
+    rds_dir <- "../../../../braincharts/LBCC/test-SA-site-merge-v2/RDS/site240920-"
+    fit_file <- paste0(rds_dir, region, "Transformed/FIT.EXTRACT.rds")
+    derived_file <- paste0(rds_dir, region, "Transformed/DERIVED.without.boot.v2.rds")
+    NewData$fs_version <- "FS5.3"
+  } else {
+    next
+  }
+  if(file.exists(fit_file)) {
+    if(nrow(NewData) > 1) {
+      FitObj <- readRDS(fit_file)
+      # Global models are currently not compatible :(
+      if (is.null(attr(FitObj$param,"transformations"))) {
+        next
+      }
+      RESULT <- Calc.Novel(NewData, Fit = FitObj, Apply = TRUE, NumberCores = 1)
+      region_list[[region]] <- RESULT[["data"]][c(retain_cols, paste0(region, "Transformed.q.wre"))]
+      norm_list[[region]] <- RESULT[["data"]][c(retain_cols, paste0(region, "Transformed.normalised"))]
+
+      #Extract curves
+      if (file.exists(derived_file)) {
+        DATA <- readRDS(derived_file)
+      } else {
+        DATA <- readRDS(str_replace_all(derived_file,".without.boot.v2",""))
+      }
+      MODELS[[region]] <- DATA$POP.CURVE.PRED
+      MODELS[[region]]$name <- region
+
+    }
+  }
+}
+
+df <- region_list %>% reduce(left_join, by = retain_cols)
+norm_df <- norm_list %>% reduce(left_join, by = retain_cols)
+
+ALL.MODELS = do.call(bind_rows,MODELS)
+
+```
+
+Next, we'll use the braincharts webapp to extract the global centiles
+
+```{r}
+#| label: load-global-centiles-from-webapp
+#| output: false
+# Global metrics (GMV, sGMV, WMV, Ventricles, meanCT, totalSA) use the LBCC
+# global models, which are incompatible with direct Calc.Novel application
+# (see skip above), so their centiles were generated separately via the
+# braincharts webapp and are merged in here.
+glob_features <- list()
+glob_features[["GMV"]]  <- read_csv("../data/ENIGMA/brainchart_results/GMV_centiles_2025-01-17.csv", show_col_types = F) %>%
+                              select(participant, sex, AgeTransformed,
+                                     GMVTransformed.q.wre, GMVTransformed.normalised,
+                                     PRED.l025.pop, PRED.m500.pop, PRED.u975.pop) %>%
+                              mutate(name = "GMV")
+
+glob_features[["sGMV"]]  <- read_csv("../data/ENIGMA/brainchart_results/sGMV_centiles_2025-01-17.csv", show_col_types = F) %>%
+                              select(participant, sex, AgeTransformed,
+                                     sGMVTransformed.q.wre, sGMVTransformed.normalised,
+                                     PRED.l025.pop, PRED.m500.pop, PRED.u975.pop) %>%
+                              mutate(name = "sGMV")
+
+glob_features[["WMV"]]  <- read_csv("../data/ENIGMA/brainchart_results/WMV_centiles_2025-01-17.csv", show_col_types = F) %>%
+                              select(participant, sex, AgeTransformed,
+                                     WMVTransformed.q.wre, WMVTransformed.normalised,
+                                     PRED.l025.pop, PRED.m500.pop, PRED.u975.pop) %>%
+                              mutate(name = "WMV")
+
+glob_features[["Ventricles"]]  <- read_csv("../data/ENIGMA/brainchart_results/Ventricles_centiles_2025-01-17.csv",
+                                         show_col_types = F) %>%
+                              select(participant, sex, AgeTransformed,
+                                     VentriclesTransformed.q.wre, VentriclesTransformed.normalised,
+                                     PRED.l025.pop, PRED.m500.pop, PRED.u975.pop) %>%
+                              mutate(name = "Ventricles")
+
+glob_features[["meanCT"]]  <- read_csv("../data/ENIGMA/brainchart_results/CT_centiles_2025-01-17.csv", show_col_types = F) %>%
+                              select(participant, sex, AgeTransformed,
+                                     meanCTTransformed.q.wre = meanCT2Transformed.q.wre,
+                                     meanCTTransformed.normalised = meanCT2Transformed.normalised,
+                                     PRED.l025.pop, PRED.m500.pop, PRED.u975.pop) %>%
+                              mutate(name = "meanCT")
+
+
+glob_features[["totalSA"]]  <- read_csv("../data/ENIGMA/brainchart_results/SA_centiles_2025-02-07.csv", show_col_types = F) %>%
+                              select(participant, sex, AgeTransformed,
+                                     totalSATransformed.q.wre = totalSA2Transformed.q.wre,
+                                     totalSATransformed.normalised = totalSA2Transformed.normalised,
+                                     PRED.l025.pop, PRED.m500.pop, PRED.u975.pop) %>%
+                              mutate(name = "totalSA")
+```
+
+```{r}
+#| label: merge-global-centiles
+#| output: false
+for (i in names(glob_features)) {
+    # Add pre-calculated centiles for GMV, WMV, and sGMV
+    df <- left_join(df, glob_features[[i]] %>%
+                                    select(-contains("PRED."),
+                                           -contains(".normalised"),
+                                           -c(name, AgeTransformed)))
+
+    # Add normalized values
+    norm_df <- left_join(norm_df, glob_features[[i]] %>%
+                                    select(-contains("PRED."),
+                                           -contains(".q.wre"),
+                                           -c(name, AgeTransformed)))
+
+    # Add curves
+    ALL.MODELS <- bind_rows(ALL.MODELS,
+                            glob_features[[i]] %>%
+                              select(AgeTransformed, sex, name,
+                                     PRED.l025.pop, PRED.m500.pop, PRED.u975.pop))
+}
+
+df <- df %>% select(-c(Ventricles.allTransformed.q.wre))
+norm_df <- norm_df %>% select(-c(Ventricles.allTransformed.normalised))
+ALL.MODELS <- ALL.MODELS %>% filter(name != "Ventricles.all")
+```
+
+## Inspect Centile Distributions
+
+```{r}
+#| label: plot-global-centile-boxplots
+#| fig-cap: "Centile scores for global brain measures (GMV, WMV, sGMV, ventricles, eTIV) by diagnostic group in the ENIGMA-22q cohort."
+tmp_df <- df %>%
+            select(participant, dx.original, age_days,
+                   GMVTransformed.q.wre, WMVTransformed.q.wre,
+                   sGMVTransformed.q.wre, VentriclesTransformed.q.wre,
+                   eTIVTransformed.q.wre) %>%
+            pivot_longer(-c(participant,dx.original, age_days),
+                         names_to = "measure",values_to = "centile") %>%
+            mutate(measure = str_replace_all(measure,"Transformed.q.wre",""))
+
+# Plot global centiles by dx
+ggplot(tmp_df, aes(x = dx.original, y = centile)) +
+    geom_hline(yintercept = 0.5, linetype = "dashed") +
+    geom_boxplot() + facet_wrap(~ measure, ncol =3)
+```
+
+```{r, fig.height = 16, fig.width = 12}
+#| label: plot-sa-centile-boxplots
+#| fig-cap: "Regional cortical surface area centile scores by diagnostic group in the ENIGMA-22q cohort."
+tmp_df <- df %>%
+            select(participant, dx.original, age_days, contains(".SA.")) %>%
+            pivot_longer(-c(participant,dx.original, age_days),
+                         names_to = "measure",values_to = "centile") %>%
+            mutate(measure = str_replace_all(measure,"Transformed.q.wre",""))
+
+ggplot(tmp_df, aes(x = dx.original, y = centile)) +
+    geom_hline(yintercept = 0.5, linetype = "dashed") +
+    geom_boxplot() + facet_wrap(~ measure, ncol =5)
+```
+
+```{r, fig.height = 16, fig.width = 12}
+#| label: plot-ct-centile-boxplots
+#| fig-cap: "Regional cortical thickness centile scores by diagnostic group in the ENIGMA-22q cohort."
+tmp_df <- df %>%
+            select(participant, dx.original, age_days, contains(".CT.")) %>%
+            pivot_longer(-c(participant,dx.original, age_days),
+                         names_to = "measure",values_to = "centile") %>%
+            mutate(measure = str_replace_all(measure,"Transformed.q.wre",""))
+
+ggplot(tmp_df, aes(x = dx.original, y = centile)) +
+    geom_hline(yintercept = 0.5, linetype = "dashed") +
+    geom_boxplot() + facet_wrap(~ measure, ncol =5)
+```
+
+```{r, fig.height = 16, fig.width = 12}
+#| label: plot-gm-centile-boxplots
+#| fig-cap: "Regional gray matter volume centile scores by diagnostic group in the ENIGMA-22q cohort."
+tmp_df <- df %>%
+            select(participant, dx.original, age_days, contains(".GM.")) %>%
+            pivot_longer(-c(participant,dx.original, age_days),
+                         names_to = "measure",values_to = "centile") %>%
+            mutate(measure = str_replace_all(measure,"Transformed.q.wre",""))
+
+ggplot(tmp_df, aes(x = dx.original, y = centile)) +
+    geom_hline(yintercept = 0.5, linetype = "dashed") +
+    geom_boxplot() + facet_wrap(~ measure, ncol =5)
+```
+
+## Final Processing
+
+```{r}
+#| label: rename-phenotype-columns
+#| output: false
+df <- df %>%
+        rename(dx = dx.original) %>%
+        mutate(Source = "ENIGMA",
+               session = 1,
+               Copy_Num = case_match(dx,
+                                          "22q11DS"  ~ "Del",
+                                          "CN"       ~ "CN")) %>%
+        rename(dx_psychosis = Psychotic_Disorder_Name) %>%
+        mutate(dx_psychosis = case_match(dx_psychosis,
+                                         "" ~ NA,
+                                         "22q11DS-Psy"  ~ 0,
+                                         "22q11Dup-Psy" ~ 0,
+                                         "NonPsy" ~ 0,
+                                         "22q11DS+Psy" ~ 1))
+
+
+colnames(df) <- colnames(df) %>%
+                      str_replace_all("h\\.","h_") %>%
+                      str_replace_all("Right\\.","Right_") %>%
+                      str_replace_all("Left\\.","Left_") %>%
+                      str_replace_all("lh.CT.","CT.lh_") %>%
+                      str_replace_all("rh.CT.","CT.rh_") %>%
+                      str_replace_all("lh.SA.","SA.lh_") %>%
+                      str_replace_all("rh.SA.","SA.rh_") %>%
+                      str_replace_all("lh.GM.","GM.lh_") %>%
+                      str_replace_all("rh.GM.","GM.rh_") %>%
+                      str_replace_all("Ventral.DC","VentralDC") %>%
+                      str_replace_all("GLOB.Ventricles", "Ventricles") %>%
+                      str_replace_all("SUBC","SUBC") %>%
+                      str_replace_all("\\.Cortex","_Cortex") %>%
+                      str_replace_all("\\.Vent","_Vent") %>%
+                      str_replace_all("\\.Lat","_Lat") %>%
+                      str_replace_all("\\.Proper","_Proper") %>%
+                      str_replace_all("3rd","x3rd") %>%
+                      str_replace_all("4th","x4th")
+
+colnames(norm_df) <- colnames(norm_df) %>%
+                      str_replace_all("h\\.","h_") %>%
+                      str_replace_all("Right\\.","Right_") %>%
+                      str_replace_all("Left\\.","Left_") %>%
+                      str_replace_all("lh.CT.","CT.lh_") %>%
+                      str_replace_all("rh.CT.","CT.rh_") %>%
+                      str_replace_all("lh.SA.","SA.lh_") %>%
+                      str_replace_all("rh.SA.","SA.rh_") %>%
+                      str_replace_all("lh.GM.","GM.lh_") %>%
+                      str_replace_all("rh.GM.","GM.rh_") %>%
+                      str_replace_all("Ventral.DC","VentralDC") %>%
+                      str_replace_all("GLOB.Ventricles", "Ventricles") %>%
+                      str_replace_all("SUBC","SUBC") %>%
+                      str_replace_all("\\.Cortex","_Cortex") %>%
+                      str_replace_all("\\.Vent","_Vent") %>%
+                      str_replace_all("\\.Lat","_Lat") %>%
+                      str_replace_all("\\.Proper","_Proper") %>%
+                      str_replace_all("3rd","x3rd") %>%
+                      str_replace_all("4th","x4th")
+
+# Add Euler Number
+df <- df %>% left_join(euler.stats, by = c("participant" = "subject"))
+```
+
+## Combine Volumes and Centiles into Single File
+
+```{r}
+#| label: combine-volumes-and-centiles
+#| output: false
+final_df <- left_join(df,norm_df) %>%
+                relocate(Source:dx.original, .after = dx) %>%
+                select(-c(dx.original, Copy_Num))
+```
+
+## Save ENIGMA Analysis Dataset
+
+```{r}
+#| label: save-output-csvs
+#| output: false
+write.csv(final_df, '../data/ENIGMA/ENIGMA_data.csv', row.names = F)
+```
+
+## Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```

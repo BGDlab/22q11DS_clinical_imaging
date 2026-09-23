@@ -1,0 +1,309 @@
+---
+title: "Merge CHOP and ENIGMA Analysis Datasets"
+author: "Benjamin Jung, PhD"
+format:
+  pdf:
+    documentclass: scrreprt
+    toc: true
+    number-sections: true
+execute:
+  echo: true
+  warning: false
+  message: false
+editor: visual
+---
+
+```{r}
+#| label: load-libraries
+#| output: false
+rm(list=ls())
+set.seed(2514)
+library(tidyverse)
+library(glue)
+```
+
+## Prepare Data
+
+### Load Research Data (ENIGMA)
+
+```{r}
+#| label: load-enigma-data
+#| output: false
+# Load ENIGMA centiles
+enigma_df <- read_csv('../data/ENIGMA/ENIGMA_data.csv',
+                      show_col_types = FALSE) %>%
+                  mutate(euler_mpr = euler)
+```
+
+### Load Clinical Data
+
+```{r}
+#| label: load-chop-data
+#| output: false
+# modality controls which CHOP centile file is loaded and the suffix used for the
+# saved output below: "combined" (main analyses) merges the full CHOP centile set
+# with CT/mean-CT columns computed separately from MPRAGE-only ("mpr") scans, since
+# reliable CT requires the MPR sequence and is only available for a subset of scans
+# (age >= 2 years, hence the age_days filter below)
+modality <- "mpr"
+
+if (modality == "mpr") {
+  suf <- "_mpr"
+} else if (modality == "all") {
+  suf <- "_all"
+} else if (modality == "combined") {
+  suf <- "_combined"
+}
+if (modality != "combined") {
+  # Load centile data
+  chop_df <- read_csv(glue('../data/CHOP/CHOP_data{suf}.csv'), show_col_types = FALSE) %>%
+                    mutate(euler_mpr = euler)
+
+} else {
+  # Load all centile data
+  chop_df <- read_csv(glue('../data/CHOP/CHOP_data_all.csv'), show_col_types = FALSE) %>%
+                    select(-starts_with("CT."),-starts_with("meanCT")) %>%
+                    select(-c(ss_qc))
+  print(dim(chop_df))
+  # Load MPR centile data
+  chop_mpr_df <- read_csv(glue('../data/CHOP/CHOP_data_mpr.csv'), show_col_types = FALSE) %>%
+                    select(-starts_with("GM."),-starts_with("SA."),
+                           -starts_with("SUBC."),-starts_with("SS."),
+                           -starts_with("totalSA"),-starts_with("GMV"),
+                           -starts_with("WMV"), -starts_with("eTIV"),
+                           -starts_with("sGMV"),-starts_with("Cerebellum"),
+                           -starts_with("Ventricles")) %>%
+                    mutate(euler_mpr = euler, .after = euler) %>%
+                    filter(age_days >= (365.25*2+280)) %>%
+                    select(participant, sex, age_days, dx, euler_mpr,
+                           starts_with("CT."),starts_with("meanCT"))
+
+  chop_df <- full_join(chop_df, chop_mpr_df) %>%
+                filter(!is.na(Source))
+}
+
+# Rescale CHOP volumes to match ENIGMA data
+chop_df <- chop_df %>% mutate(across(contains("Transformed.normalised"), ~ .x/10000))
+```
+
+### Identify Cohort-Specific Features to Drop
+
+```{r}
+#| label: check-column-overlap
+#| echo: false
+#| output: false
+# Identify centile feature columns present in only one cohort (e.g. due to
+# differing segmentation atlases) so they can be dropped before combining below
+print("ENIGMA Columns Missing")
+missing_enigma <- colnames(enigma_df)[!(colnames(enigma_df) %in% colnames(chop_df)) &
+                                      endsWith(colnames(enigma_df),"q.wre")]
+
+print("CHOP Columns Missing")
+missing_CHOP <- colnames(chop_df)[!(colnames(chop_df) %in% colnames(enigma_df)) &
+                                      endsWith(colnames(chop_df),"q.wre") &
+                                      !startsWith(colnames(chop_df),"SS.")]
+
+exclude_cols <- c(missing_enigma, missing_CHOP)
+```
+
+### Combine Data
+
+```{r}
+#| label: combine-chop-enigma
+
+# Bind ENIGMA and CHOP data into a single dataset
+df <- bind_rows(chop_df,enigma_df) %>%
+          dplyr::select(-all_of(exclude_cols), -dx_psychosis)
+table(df$Source, df$dx)
+```
+
+```{r}
+#| label: recode-variables
+#| output: false
+df$Source <- factor(df$Source,levels = c("ENIGMA","CHOP"))
+df$dx <- factor(df$dx,levels = c("CN","22q11DS"))
+df$age_years <- (df$age_days - 280)/365.25
+
+# Recode site optionally to include CHOP as single site when matching with ENIGMA
+df$site2 <- df$site
+df$site2[df$Source == "CHOP"] <- "CHOP"
+```
+
+### Z-Score Data
+
+```{r}
+#| label: compute-centile-zscores
+#| output: false
+# Convert centiles to z-scores; centiles of exactly 0/1 are nudged to just inside
+# (0, 1) since qnorm(0) / qnorm(1) are undefined (+/-Inf)
+zscores <- df %>%
+              select(contains("Transformed.q.wre")) %>%
+              mutate(across(everything(), .fns = ~ ifelse(. == 1, 0.9999999999999999, .)),
+                     across(everything(), .fns = ~ ifelse(. == 0, 0.0000000000000001, .)),
+                     across(everything(), qnorm))
+colnames(zscores) <- str_replace_all(colnames(zscores), "Transformed.q.wre","Transformed.q.zscore")
+
+#Bind z-score to original results
+df <- bind_cols(df, zscores)
+```
+
+```{r}
+#| label: filter-deletion-type-and-sites
+# Exclude atypical deletions (non-A-D)
+df <- df %>% 
+        mutate(Deletion_Type = case_when(is.na(Deletion_Type) & dx == "22q11DS" ~ "FISH",
+                                          dx == "CN" ~ "None",
+                                          .default = Deletion_Type)) %>% 
+        filter((Deletion_Type %in% c("A-D","None")))
+
+# Remove ENIGMA sites that don't have cases
+enigma_sites <- df %>%
+                  filter(Source == "ENIGMA") %>%
+                  group_by(dx, site) %>%
+                  summarize(n = n()) %>%
+                  pivot_wider(id_cols = "site", names_from = "dx", values_from = "n") %>%
+                  filter(!is.na(`22q11DS`))
+
+df <- df %>% filter(site2 %in% c("CHOP", enigma_sites$site))
+
+table(df$Deletion_Type, df$Source, useNA = "ifany")
+```
+
+### Specify Features to Test
+
+```{r}
+#| label: define-analysis-features
+#| output: false
+features <- colnames(df)[endsWith(colnames(df),".q.wre") &
+                           !startsWith(colnames(df),"SS.")] %>%
+              str_replace_all("Transformed.q.wre","")
+
+# Exclude cerebellar and ventricular regions, we'll treat them as global only
+exclude_list <- c("SUBC.x4th_Ventricle","SUBC.x3rd_Ventricle",
+                  "SUBC.Left_Cerebellum_Cortex","SUBC.Right_Cerebellum_Cortex",
+                  "SUBC.Left_Inf_Lat_Vent","SUBC.Right_Inf_Lat_Vent","SUBC.Brain.Stem",
+                  "SUBC.Left_Lateral_Ventricle","SUBC.Right_Lateral_Ventricle")
+
+features <- features[!(features %in% exclude_list)]
+
+features.ct    <- glue('{features[startsWith(features,"CT.")]}Transformed.q.wre')
+features.sa   <- glue('{features[startsWith(features,"SA.")]}Transformed.q.wre')
+features.gm    <- glue('{features[startsWith(features,"GM.")]}Transformed.q.wre')
+features.subc    <- glue('{features[startsWith(features,"SUBC.")]}Transformed.q.wre')
+```
+
+### Identify Longitudinal Samples
+
+```{r}
+#| label: identify-overlapping-and-longitudinal-samples
+#| output: false
+# Find CHOP Samples with multiple visits
+multi_samples <- df$participant %in% names(which(table(df$participant) > 1))
+
+df$participant[!is.na(df$SubjID)] <- df$SubjID[!is.na(df$SubjID)]
+
+# Make a df of only longitudinal samples for later
+df.long <- df[multi_samples,]
+
+```
+
+```{r}
+#| label: select-one-sample-per-participant
+# Select one sample per individual, prioritizing
+  # (a) normal pathology
+  # (b) presence of CT measure
+  # (c) young age
+df <- df %>% arrange(desc(pathology == "Normal"), is.na(meanCTTransformed.q.wre), age_days)
+df <- df[!(df %>% select(participant, Source) %>% duplicated()),]
+df$main_analysis <- TRUE
+
+table(df$Source, df$dx)
+```
+
+### Get dataframe of abnormal morphology
+
+```{r}
+#| label: separate-abnormal-pathology
+abnormal_pathology <- df %>% filter(pathology == "Abnormal" & !is.na(pathology))
+df <- df %>% filter(pathology == "Normal" | is.na(pathology))
+table(df$dx, df$Source, useNA = "ifany")
+```
+
+### Remove SLIP controls that no longer match
+
+```{r}
+#| label: filter-unmatched-controls
+# `matched` flags controls that were paired to cases via demographic matching
+# upstream; controls left unmatched after case-level exclusions above are dropped
+# here to preserve the intended case:control matching
+df_all <- df
+df <- df %>%
+        mutate(matched = ifelse(is.na(matched), TRUE, matched)) %>%
+        filter(matched)
+table(df$dx,df$Source)
+```
+
+## Prepare MRI Atlases
+
+### Set Up Atlases
+
+```{r}
+#| label: load-atlas-libraries
+#| output: false
+library(ggseg)
+library(gridExtra)
+library(ggsegTissue)
+```
+
+```{r}
+#| label: prepare-brain-atlas-labels
+#| output: false
+# Some labels in each atlas are NA, replace with the ROI
+dk_plot <- as_tibble(ggseg::dk)
+dk_plot$label[is.na(dk_plot$label)] <- dk_plot$roi[is.na(dk_plot$label)]
+
+aseg_plot <- as_tibble(ggseg::aseg) %>%
+                mutate(label = str_replace_all(label, "-","_"))
+aseg_plot$roi <- sprintf("%04d", as.numeric(rownames(aseg_plot)))
+aseg_plot$label[is.na(aseg_plot$label)] <- aseg_plot$roi[is.na(aseg_plot$label)]
+```
+
+### Set up color scheme
+
+```{r}
+#| label: define-color-scheme
+#| output: false
+color_scheme <- c("royalblue","white","firebrick")
+```
+
+## Save Environment
+
+```{r}
+#| label: save-analysis-dataset
+#| output: false
+# Save ONLY the objects the downstream analysis scripts actually consume, rather
+# than the whole workspace (save.image), which would carry every intermediate
+# merge/lookup table -- including participant-level ones -- into the .RData.
+#
+#   df                  analysis-ready CHOP + ENIGMA centile/deviation data
+#   df_all              full CHOP 22q11DS sample before per-participant selection
+#   df.long             longitudinal (multi-session) subset
+#   abnormal_pathology  scans excluded for pathology, used in sensitivity analyses
+#   features            feature names modeled throughout
+#   dk_plot / aseg_plot ggseg atlases used by the plotting helpers in utils.R
+#   color_scheme        shared brain-map colour scale
+#
+# Output is analysis_prep_combined.RData or analysis_prep_mpr.RData depending on
+# `modality` above (combined = main analyses; mpr = MPR-only sensitivity analyses)
+save(list = c("df", "df_all", "df.long", "abnormal_pathology",
+              "features",
+              "dk_plot", "aseg_plot", "color_scheme"),
+     file = glue('../data/analysis_prep{suf}.RData'))
+```
+
+## Session Info
+
+```{r}
+#| label: session-info
+sessionInfo()
+```
