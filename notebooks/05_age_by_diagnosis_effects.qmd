@@ -42,7 +42,7 @@ mpr_only_cols <- features[grepl("CT",features)]
 
 # dx * age_days interaction term: tests whether the case-control effect on
 # deviation scores changes with age.
-res <- fit_interaction_model_continuous(df_chop, cov_str, features, rand_str = rand_str,
+res <- fit_interaction_model(df_chop, cov_str, features, rand_str = rand_str,
                                   model_type = "zscore", mpr_only_cols = mpr_only_cols)
 
 res_chop <- summarize_model_results(res,"predictor22q11DS:interactor")
@@ -65,7 +65,7 @@ rand_str <- ""
 
 mpr_only_cols <- c()
 
-res <- fit_interaction_model_continuous(df_enigma, cov_str, features, rand_str = rand_str, 
+res <- fit_interaction_model(df_enigma, cov_str, features, rand_str = rand_str, 
                                   model_type = "zscore", mpr_only_cols = mpr_only_cols)
 
 res_enigma <- summarize_model_results(res,"predictor22q11DS:interactor")

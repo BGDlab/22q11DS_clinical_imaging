@@ -1,5 +1,5 @@
 ---
-title: "Clinical Outcome Associations (Figures S12, S23)"
+title: "Clinical Outcome Associations (Figures S12, S13)"
 author: "Benjamin Jung, PhD"
 format:
   pdf:
@@ -321,7 +321,7 @@ res_all <- res_all %>% arrange(p.value) %>%
 
 ```{r, fig.height = 3, fig.width = 6.69}
 #| label: plot-chd-associations-figure-s13
-#| fig-cap: "Figure S23. Associations between global LMSz deviation scores and congenital heart defect status and grade (estimates with 95% confidence intervals)."
+#| fig-cap: "Figure S13. Associations between global LMSz deviation scores and congenital heart defect status and grade (estimates with 95% confidence intervals)."
 ggplot(res_all,
        aes(x = term, y = estimate,
            color = measure, group = measure)) +

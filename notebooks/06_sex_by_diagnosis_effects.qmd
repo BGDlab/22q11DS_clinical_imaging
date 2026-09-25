@@ -1,5 +1,5 @@
 ---
-title: "Sex Effects Within 22q11DS Cases (Figure S5)"
+title: "Sex-by-Diagnosis Interaction Effects (Figure S5)"
 author: "Benjamin Jung, PhD"
 format:
   pdf:
@@ -24,7 +24,7 @@ df_chop <- df %>% filter(Source == "CHOP")
 df_enigma <- df %>% filter(Source == "ENIGMA")
 ```
 
-## Sex Effects on Deviation Scores Within Cases
+## Sex Interaction Effects on Deviation Scores
 
 ### CHOP
 
@@ -36,13 +36,12 @@ rand_str <- ""
 
 mpr_only_cols <- features[grepl("CT",features)]
 
-# Sex effect on deviation scores
-res <- fit_group_comparison_models(df_chop, cov_str, features, rand_str = rand_str,
-                 predictor = "sex", group_control = "Male",
-                 group_case = "Female", model_type = "zscore",
-                 mpr_only_cols = mpr_only_cols)
+# Sex interaction effect on deviation scores
+res <- fit_interaction_model(df_chop, cov_str, features, interactor = "sex", 
+                                  rand_str = rand_str,  model_type = "zscore", 
+                                  mpr_only_cols = mpr_only_cols)
 
-res_chop_z <- summarize_model_results(res,"predictorTRUE")
+res_chop_z <- summarize_model_results(res, "predictor22q11DS:interactorMale")
 ```
 
 ```{r}
@@ -62,12 +61,11 @@ rand_str <- ""
 
 mpr_only_cols <- c()
 
-res <- fit_group_comparison_models(df_enigma, cov_str, features, rand_str = rand_str, 
-                 predictor = "sex", group_control = "Male", 
-                 group_case = "Female", model_type = "zscore",
-                 mpr_only_cols = mpr_only_cols)
+res <- fit_interaction_model(df_enigma, cov_str, features, interactor = "sex", 
+                                  rand_str = rand_str,  model_type = "zscore", 
+                                  mpr_only_cols = mpr_only_cols)
 
-res_enigma_z <- summarize_model_results(res,"predictorTRUE")
+res_enigma_z <- summarize_model_results(res, "predictor22q11DS:interactorMale")
 ```
 
 ```{r}
@@ -122,7 +120,7 @@ p_enigma
 
 ```{r, fig.width = 6.69, fig.height = 10}
 #| label: combine-and-save-figure
-#| fig-cap: "Figure S5. Sex effects (female vs. male) on global and regional centile scores of structural MRI metrics within 22q11DS cases in the CHOP and ENIGMA cohorts."
+#| fig-cap: "Figure S5. Sex-by-diagnosis interaction effects on global and regional centile scores of structural MRI metrics in the CHOP and ENIGMA cohorts."
 t1 <- ggdraw() + 
   draw_label("CHOP", x = 0.01, hjust = 0, fontface = "bold")
 t2 <- ggdraw() + 

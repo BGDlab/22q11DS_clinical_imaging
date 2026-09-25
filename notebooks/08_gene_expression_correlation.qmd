@@ -298,8 +298,6 @@ for (cohort in c("CHOP","ENIGMA")) {
 
 ## Per-Gene Correlation Across All Brain-Expressed Genes
 
-<https://www-sciencedirect-com.proxy.library.upenn.edu/science/article/pii/S1053811919300114#sec3>
-
 ```{python}
 #| label: fetch-desikan-killiany-atlas
 #| output: false

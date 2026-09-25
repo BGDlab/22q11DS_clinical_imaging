@@ -464,8 +464,6 @@ res_ref  <- res_chop_z       # reference (primary) result to compare against
 summarize_model_changes(res_test, res_ref)
 ```
 
-## 
-
 ## Sensitivity Analysis: High-Resolution MPRAGE Scans Only (Figure S17)
 
 ### CHOP
@@ -499,7 +497,7 @@ summarize_results_by_cortex(res_chop_mpr, caption = "Case-Control Results Groupe
 #| label: save-table-chop-mprage
 #| output: false
 table_fmt <- fmt_table(res_chop_mpr)
-write_csv(table_fmt, "../tables/formatted/table_s6.csv")
+write_csv(table_fmt, "../tables/formatted/table_s16.csv")
 ```
 
 ### Permutation Test
@@ -1204,22 +1202,22 @@ p_enigma_fixed <- assemble_main_figure_layout(res_enigma_fixed, df_enigma, fill_
 
 ```{r, fig.width = 6.69, fig.height = 5}
 #| echo: false
-#| label: chop-effect-fixed
-#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the CHOP cohort (mixed effects model with random intercept for site)."
+#| label: chop-effect-scanner
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the CHOP Cohort with scanner covariate."
 p_chop_fixed
 ```
 
 ```{r, fig.width = 6.69, fig.height = 5}
 #| echo: false
-#| label: enigma-effect-fixed
-#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the ENIGMA Cohort (mixed effects model with random intercept for site)."
+#| label: enigma-effect-scanner
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the ENIGMA Cohort with scanner covariate."
 p_enigma_fixed
 ```
 
 #### Combine Plots
 
 ```{r, fig.width = 6.69, fig.height = 11}
-#| label: combine-plots-site
+#| label: combine-plots-scanner
 #| fig-cap: "Combined CHOP and ENIGMA case-control effect sizes (Cohen's d) covarying for scanner site, with between-cohort permutation-test correlations."
 t1 <- ggdraw() + 
   draw_label("CHOP", x = 0.01, hjust = 0, fontface = "bold")
@@ -1425,7 +1423,7 @@ p_chop_race <- assemble_main_figure_layout(res_chop_race, df_chop, fill_col, col
 ```{r, fig.width = 6.69, fig.height = 5}
 #| echo: false
 #| label: chop-effect-race
-#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the CHOP cohort (mixed effects model with random intercept for site)."
+#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the CHOP cohort with covariate for self-described race."
 p_chop_race
 ```
 
