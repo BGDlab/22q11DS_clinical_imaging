@@ -1,5 +1,7 @@
 # Charting Brain Structure in 22q11.2 Deletion Syndrome with Clinical Neuroimaging
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.22968586.svg)](https://doi.org/10.5281/zenodo.22968586)
+
 Analysis code for:
 
 > Jung B, et al. Charting brain structure in 22q11.2 deletion syndrome with clinical neuroimaging.
