@@ -77,7 +77,7 @@ authors:
     family-names: Alexander-Bloch
   - name: "ENIGMA 22q11.2 Deletion Syndrome Working Group"
 repository-code: "https://github.com/BGDlab/22q11DS_clinical_imaging"
-license: CC-BY-4.0
+license: MIT
 version: "1.0.0"
 date-released: "2026-09-25"
 keywords:
