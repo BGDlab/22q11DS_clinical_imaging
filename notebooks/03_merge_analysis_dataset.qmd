@@ -281,9 +281,7 @@ color_scheme <- c("royalblue","white","firebrick")
 ```{r}
 #| label: save-analysis-dataset
 #| output: false
-# Save ONLY the objects the downstream analysis scripts actually consume, rather
-# than the whole workspace (save.image), which would carry every intermediate
-# merge/lookup table -- including participant-level ones -- into the .RData.
+# Save objects used in downstream analysis scripts 
 #
 #   df                  analysis-ready CHOP + ENIGMA centile/deviation data
 #   df_all              full CHOP 22q11DS sample before per-participant selection

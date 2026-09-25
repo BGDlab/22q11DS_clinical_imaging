@@ -1,0 +1,88 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite it using the metadata below, along with the associated article."
+type: software
+title: "Charting Brain Structure in 22q11.2 Deletion Syndrome with Clinical Neuroimaging"
+authors:
+  - given-names: Benjamin
+    family-names: Jung
+  - given-names: J. Eric
+    family-names: Schmitt
+  - given-names: Jakob
+    family-names: Seidlitz
+  - given-names: Jenna M.
+    family-names: Schabdach
+  - given-names: Shivaram
+    family-names: Karandikar
+  - given-names: T. Blaine
+    family-names: Crowley
+  - given-names: Lena
+    family-names: Dorfschmidt
+  - given-names: Ayan S.
+    family-names: Mandal
+  - given-names: Dabriel
+    family-names: Zimmerman
+  - given-names: Remo M. S.
+    family-names: Williams
+  - given-names: Smrithi
+    family-names: Prem
+  - given-names: Elizabeth
+    family-names: Levitis
+  - given-names: Margaret
+    family-names: Gardner
+  - given-names: Katherine
+    family-names: Cyr
+  - given-names: Viveknarayanan
+    family-names: Padmanabhan
+  - given-names: Jerome H.
+    family-names: Taylor
+  - given-names: Kosha
+    family-names: Ruparel
+  - given-names: Rune
+    family-names: Boen
+  - given-names: Carrie E.
+    family-names: Bearden
+  - given-names: Christopher R. K.
+    family-names: Ching
+  - given-names: Bogdan
+    family-names: Pasaniuc
+  - given-names: Stewart A.
+    family-names: Anderson
+  - given-names: Daniel
+    family-names: McGinn
+  - given-names: Elaine
+    family-names: Zackai
+  - given-names: Beverly
+    family-names: Emanuel
+  - given-names: Sarah
+    family-names: Hopkins
+  - given-names: Madeline
+    family-names: Chadehumbe
+  - given-names: Karen J.
+    family-names: Low
+  - given-names: Tim J.
+    family-names: Cole
+  - given-names: Richard A. I.
+    family-names: Bethlehem
+  - given-names: R. Taki
+    family-names: Shinohara
+  - given-names: J. William
+    family-names: Gaynor
+  - given-names: David R.
+    family-names: Roalf
+  - given-names: Raquel E.
+    family-names: Gur
+  - given-names: Donna M.
+    family-names: McDonald-McGinn
+  - given-names: Aaron
+    family-names: Alexander-Bloch
+  - name: "ENIGMA 22q11.2 Deletion Syndrome Working Group"
+repository-code: "https://github.com/BGDlab/22q11DS_clinical_imaging"
+license: CC-BY-4.0
+version: "1.0.0"
+date-released: "2026-09-25"
+keywords:
+  - 22q11.2 deletion syndrome
+  - normative modeling
+  - brain growth charts
+  - clinical MRI
+  - imaging transcriptomics

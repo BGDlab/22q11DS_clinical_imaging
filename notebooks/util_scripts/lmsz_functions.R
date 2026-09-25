@@ -1,3 +1,5 @@
+# backtransform_centiles is adapted from Apply.Param function in the brainchart/Lifespan repo
+# https://github.com/brainchart/Lifespan
 backtransform_centiles <- function(NEWData, FITParam,
                                    Reference.Holder=NULL,
                                    MissingToZero=TRUE, NAToZero=TRUE, Prefix="",
@@ -147,80 +149,6 @@ backtransform_centiles <- function(NEWData, FITParam,
 }
 
 
-
-pred_og_centiles <- function(gamlssModel, og.data, get.std.scores = FALSE, new.data=NULL){
-  pheno <- gamlssModel$mu.terms[[2]]
-  
-  #subset df cols just to predictors from model
-  predictor_list <- list_predictors(gamlssModel)
-  stopifnot("Dataframe columns and model covariates don't match" = 
-              predictor_list %in% names(og.data))
-  if (is.null(new.data)) {
-    newData <- og.data
-    predict_me <- og.data
-  } else {
-    stopifnot("Dataframe columns and model covariates don't match" = 
-                predictor_list %in% names(new.data))
-    newData <- new.data
-    predict_me <- new.data
-    #make sure all vals are within range of those originally modeled
-    check_range(subset(og.data, select = predictor_list), newData)
-  }
-  
-  #predict
-  predModel <- predictAll(gamlssModel, newdata=newData, data=og.data, type= "response")
-  
-  #get dist type (e.g. GG, BCCG) and write out function
-  fname <- gamlssModel$family[1]
-  pfun <- paste0("p", fname)
-  
-  #look for moments
-  has_sigma <- "sigma" %in% gamlssModel[[2]]
-  has_nu <- "nu" %in% gamlssModel[[2]]
-  has_tau <- "tau" %in% gamlssModel[[2]]
-  
-  centiles <- c()
-  #iterate through participants
-  for (i in 1:nrow(predict_me)){
-    cent_args <- list(predict_me[[pheno]][[i]], predModel$mu[[i]])
-    
-    if (has_sigma){
-      cent_args$sigma <- predModel$sigma[[i]]
-    }
-    if (has_nu){
-      cent_args$nu <- predModel$nu[[i]]
-    } 
-    if (has_tau){
-      cent_args$tau <- predModel$tau[[i]]
-    } 
-    
-    centiles[i] <- do.call(pfun, cent_args)
-    
-    #don't let centile = 1 (for z-scores)!
-    if (centiles[i] == 1) {
-      centiles[i] <- 0.9999999999999999
-    }
-    #don't let centile = 0 (for z-scores)!
-    if (centiles[i] == 0) {
-      centiles[i] <- 0.0000000000000001 #25 dec places
-    }
-    
-  }
-  if (get.std.scores == FALSE){
-    return(centiles)
-  } else {
-    #get 'z scores' from normed centiles - how z.score() does it
-    rqres <- qnorm(centiles)
-    
-    #return dataframe
-    df <- data.frame("centile" = centiles,
-                     "std_score" = rqres)
-    return(df)
-  } 
-  
-}
-
-
 backtransform_centile_fans <- function(pheno, sim_list) {
   # Steps:
   # 1 - Load SLIP and LMSz growth charts
@@ -247,9 +175,9 @@ backtransform_centile_fans <- function(pheno, sim_list) {
   growthChartModel <- readRDS(glue("../lmsz/lmsz_models_slip/SLIP_lmsz_{old_pheno}Transformed.rds"))
   # Load SLIP fit model
   if (grepl("CT",pheno)) {
-    fit_file <- glue("/mnt/isilon/bgdlab_processing/braincharts/SLIP/recon-all-clinical/gamlss/RDS/mpr-{old_pheno}Transformed/FIT.EXTRACT.rds")
+    fit_file <- glue("../../../../braincharts/SLIP/recon-all-clinical/gamlss/RDS/mpr-{old_pheno}Transformed/FIT.EXTRACT.rds")
   } else {
-    fit_file <- glue("/mnt/isilon/bgdlab_processing/braincharts/SLIP/recon-all-clinical/gamlss/RDS/rac-{old_pheno}Transformed/FIT.EXTRACT.rds")
+    fit_file <- glue("../../../../braincharts/SLIP/recon-all-clinical/gamlss/RDS/rac-{old_pheno}Transformed/FIT.EXTRACT.rds")
   }
   
   orig_fit <- readRDS(fit_file)
@@ -351,6 +279,9 @@ backtransform_centile_fans <- function(pheno, sim_list) {
   return(out_df)
 }
 
+# pred_og_centile_mod is adapted from the gamlssTools package
+# https://github.com/BGDlab/gamlssTools
+
 pred_og_centile_mod <- function(gamlssModel, og.data, get.std.scores = FALSE, new.data=NULL){
   pheno <- gamlssModel$mu.terms[[2]]
   
@@ -407,7 +338,7 @@ pred_og_centile_mod <- function(gamlssModel, og.data, get.std.scores = FALSE, ne
     }
     #don't let centile = 0 (for z-scores)!
     if (centiles[i] == 0) {
-      centiles[i] <- 0.0000000000000001 #25 dec places
+      centiles[i] <- 0.0000000000000001
     }
     
   }

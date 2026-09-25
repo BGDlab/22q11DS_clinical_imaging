@@ -108,14 +108,14 @@ p_enigma <- assemble_main_figure_layout(res_enigma, df_enigma, fill_col, color_s
 ```{r, fig.width = 8.5, fig.height = 6.5}
 #| echo: false
 #| label: chop-effect
-#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the CHOP cohort."
+#| fig-cap: "Differences in global and regional centile score age interaction effects in the CHOP cohort."
 p_chop
 ```
 
 ```{r, fig.width = 8.5, fig.height = 6.5}
 #| echo: false
 #| label: enigma-effect
-#| fig-cap: "Differences in global and regional centile scores of structural MRI metrics between case and control groups in the ENIGMA Cohort."
+#| fig-cap: "Differences in global and regional centile score age interaction effects in the ENIGMA Cohort."
 p_enigma
 ```
 

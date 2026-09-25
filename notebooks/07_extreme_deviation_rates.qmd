@@ -194,14 +194,14 @@ print(res)
 #| echo: false
 #| output: false
 #| label: cortical-spin-test
-import python_util
+from util_scripts import parcellation_util
 import pandas as pd
 n_perm = 1000
 
 prop_df = r.outlier_df
 cats = ["GM","SA","CT"]
 res = pd.DataFrame(columns=['corr', 'pval'], index=cats)
-parcellation, dk_info = python_util.define_parcellation()
+parcellation, dk_info = parcellation_util.define_parcellation()
 
 for cat in cats:
   low_chop_tmp = prop_df.loc[prop_df.label.str.startswith(cat),
@@ -215,7 +215,7 @@ for cat in cats:
   low_enigma_tmp.loc[:,"hemi_label"] = low_enigma_tmp["label"].str.replace(f"{cat}.","")
 
   # Spin test                  
-  res.loc[cat,["corr","pval"]] = python_util.spin_test(low_chop_tmp,
+  res.loc[cat,["corr","pval"]] = parcellation_util.spin_test(low_chop_tmp,
                                                        low_enigma_tmp, 
                                                       "prop_low", dk_info, parcellation)
   

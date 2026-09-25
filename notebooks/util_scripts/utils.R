@@ -1,13 +1,7 @@
-# Shared setup, constants, and helper functions sourced by the analysis scripts
-# (04_cohort_demographics.qmd onward). Defines the model-fitting wrappers used
-# for case-control, age/sex-interaction, and permutation-based spatial
-# correlation tests described in the manuscript's Statistical Analysis section,
-# along with the brain-atlas plotting helpers used to build Figures 1-4.
+# Shared setup, constants, and helper functions sourced by the analysis scripts. 
+# Defines the model-fitting wrappers used for case-control, age/sex-interaction, 
+# and permutation-based spatial correlation tests, along with the brain-atlas plotting helpers
 
-# NOTE: this file deliberately does NOT call rm(list=ls()). A sourced library
-# should never clear its caller's environment -- doing so silently destroys the
-# user's objects if utils.R is re-sourced mid-session. Scripts that want a clean
-# slate should call rm(list=ls()) themselves before sourcing this file.
 set.seed(2514)
 
 library(knitr)
@@ -29,9 +23,7 @@ library(flextable)
 library(kableExtra)
 library(gridExtra)
 
-# Global brain measures modeled throughout the analysis scripts (order matches
-# manuscript Table 1 / Figure 1): ICV, cortical GMV, subcortical GMV, WMV,
-# ventricular volume, cerebellum volume, total surface area, mean cortical thickness.
+# Global brain measures modeled throughout the analysis scripts
 global_measures <- c("eTIV", "GMV", "sGMV", "WMV", "Ventricles", "Cerebellum.all",
                      "totalSA", "meanCT")
 
@@ -59,17 +51,15 @@ figure_theme <- theme(
 )
 
 
-# Converts a point size to the units ggplot's geom_text()/annotate() expect, so
-# in-panel annotation text matches the pt sizes used elsewhere in figure_theme.
+# Converts a point size to the units ggplot's geom_text()/annotate() expect
 annotation_pt <- function(pt) pt / 2.845276
 
 # Main Model ---------------------------------
-# Fits the primary case-control (or other two-group) linear model independently
-# for each brain feature and returns one row of results per feature, with the
-# model t-statistic converted to Cohen's d. This is the workhorse behind the
-# global/regional effect-size analyses (Figure 1) and sensitivity analyses.
-fit_group_comparison_models <- function(data, cov_str, features, predictor = "dx", group_control = "CN", group_case = "22q11DS",rand_str = "", model_type = "centile",
-                      mpr_only_cols = NA, simple = F) {
+# Fits the primary case-control linear model for each brain feature 
+fit_group_comparison_models <- function(data, cov_str, features, predictor = "dx", 
+                                        group_control = "CN", group_case = "22q11DS",
+                                        rand_str = "", model_type = "centile",
+                                        mpr_only_cols = NA, simple = F) {
   
   # Define independent predictor
   data$predictor <- factor(data[[predictor]], 
@@ -153,7 +143,7 @@ fit_group_comparison_models <- function(data, cov_str, features, predictor = "dx
 }
 
 # Subsets fit_group_comparison_models() output to one term (e.g. the diagnosis effect) and applies
-# BeFDR correction across the tested features
+# FDR correction across the tested features
 summarize_model_results <- function(res, term) {
   res_final <- res[res$term == term,] %>%
                   mutate(p.fdr = p.adjust(p.value, method = "fdr"),
@@ -169,9 +159,7 @@ summarize_model_results <- function(res, term) {
   return(res_final)
 }
 
-# Tallies how many features moved between significance/direction categories
-# between a sensitivity-analysis result (res_test) and the primary-analysis
-# result (res_ref) it's being compared to
+# Tallies how many features moved between significance/direction categories in two analyses
 summarize_model_changes <- function(res_test, res_ref) {
 
   # precompute the three row-wise comparisons (res_test and res_ref must be row-aligned)
@@ -257,8 +245,7 @@ summarize_results_by_cortex <- function(data, caption = caption) {
 }
 # Outliers ------------------------------------
 # Renders brain maps of a single value (e.g. proportion of patients below the
-# 2.5th centile) across GM/SUBC/SA/CT categories, used for the extreme-phenotype
-# maps in Figure 2.
+# 2.5th centile) across GM/SUBC/SA/CT categories
 plot_extreme_deviation_maps <- function(data, fill_col, color_scheme, plot_lims, fill_name,
                                  colorbar_title = "",sig_col = NA, cats = c("GM","SUBC","SA","CT"),
                                  cort_only = F, add_colorbar = T, add_fillbar = T, exclude_y_label = F,
@@ -353,7 +340,7 @@ plot_brain_atlas <- function(data, atlas, fill_col = "Cohens_d",  color_scheme =
                        plot_lims = c(-10,1), colorbar_title = "",sig_col = NA, p_col = "p.value",
                        position = "identity", lh_only = F, skip_sagittal = T, percent = F) {
   
-  #If seeking to plot results by significance, columns of atlas need to be ordered 
+  #If ploting results by significance, columns of atlas need to be ordered 
   # such that the significant borders take precedence over the n.s. border
   atlas <- merge(atlas, data, by = "label", all.x = T)
   if (!is.na(sig_col)) {
